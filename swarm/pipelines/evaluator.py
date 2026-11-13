@@ -816,7 +816,27 @@ def _eval_worker_task(
         )
         return m
 
-    return _exec()
+    try:
+        return _exec()
+    except Exception as exc:
+        get_logger("pipelines.evaluator").error(
+            "Evaluation subprocess failed on %s policy=%s seed=%d: %s: %s",
+            exp_cfg.scenario.scenario_id,
+            policy_name,
+            seed,
+            type(exc).__name__,
+            exc,
+        )
+        # Convert any SWIG/C++ exception (e.g. libsumo.FatalTraCIError) into a pure-Python
+        # EpisodeExecutionError so ProcessPoolExecutor IPC queues never fail on SwigPyObject pickling.
+        raise EpisodeExecutionError(
+            f"{type(exc).__name__}: {exc}",
+            context={
+                "scenario_id": exp_cfg.scenario.scenario_id,
+                "policy_name": policy_name,
+                "seed": seed,
+            },
+        ) from None
 
 
 def _atomic_write_json(path: Path, payload: Any) -> None:

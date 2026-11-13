@@ -182,7 +182,12 @@ class SumoSimulationAdapter:
         self._edge_num_lanes: dict[str, int] = {}
         self._base_open_lanes: dict[str, int] = {}
         self._base_edge_max_speed: dict[str, float] = {}
+        self._base_lane_max_speed: dict[str, float] = {}
+        self._base_lane_allows_passenger: dict[tuple[str, int], bool] = {}
         self._base_lane_disallowed: dict[str, tuple[str, ...]] = {}
+        self._incoming_edge_target_lanes: dict[str, dict[str, frozenset[int]]] = {}
+        self._outgoing_edge_source_lanes: dict[str, dict[str, frozenset[int]]] = {}
+        self._exclusive_pocket_target_lanes: dict[str, tuple[frozenset[int], ...]] = {}
         self._edge_free_tt: dict[str, float] = {}
         self._edge_adj: dict[str, tuple[str, ...]] = {}
         self._reverse_edge_adj: dict[str, tuple[str, ...]] = {}
@@ -318,35 +323,66 @@ class SumoSimulationAdapter:
             self._base_open_lanes[eid] = open_cnt
             self._base_edge_max_speed[eid] = float(edge.getSpeed())
             for ln in lanes:
-                # Record non-passenger baseline permissions; normal urban passenger lanes allow all
-                self._base_lane_disallowed[ln.getID()] = ()
+                lid = ln.getID()
+                allows_pax = bool(ln.allows("passenger"))
+                self._base_lane_max_speed[lid] = float(ln.getSpeed())
+                self._base_lane_allows_passenger[(eid, int(ln.getIndex()))] = allows_pax
+                self._base_lane_disallowed[lid] = () if allows_pax else ("passenger",)
 
             free_tt = float(edge.getLength()) / max(0.5, float(edge.getSpeed()))
             self._edge_free_tt[eid] = free_tt
 
         adj_sets: dict[str, set[str]] = {eid: set() for eid in self._edge_free_tt}
         rev_sets: dict[str, set[str]] = {eid: set() for eid in self._edge_free_tt}
+        inc_targets_by_edge: dict[str, dict[str, set[int]]] = defaultdict(lambda: defaultdict(set))
+        out_sources_by_edge: dict[str, dict[str, set[int]]] = defaultdict(lambda: defaultdict(set))
+        excl_pockets_by_edge: dict[str, list[frozenset[int]]] = defaultdict(list)
+
         for edge in net.getEdges():
             if edge.isSpecial():
                 continue
             eid = edge.getID()
             if eid not in adj_sets:
                 continue
+            lane_out_targets: dict[int, dict[str, set[int]]] = defaultdict(lambda: defaultdict(set))
             for out_edge, conns in edge.getOutgoing().items():
                 if out_edge.isSpecial():
                     continue
                 oid = out_edge.getID()
                 if oid not in adj_sets:
                     continue
-                if any(
-                    c.getFromLane().allows("passenger") and c.getToLane().allows("passenger")
-                    for c in conns
-                ):
+                pax_conns = [
+                    c for c in conns if c.getFromLane().allows("passenger") and c.getToLane().allows("passenger")
+                ]
+                if pax_conns:
                     adj_sets[eid].add(oid)
                     rev_sets[oid].add(eid)
+                    for c in pax_conns:
+                        from_idx = int(c.getFromLane().getIndex())
+                        to_idx = int(c.getToLane().getIndex())
+                        inc_targets_by_edge[oid][eid].add(to_idx)
+                        out_sources_by_edge[eid][oid].add(from_idx)
+                        lane_out_targets[from_idx][oid].add(to_idx)
+
+            for targets_by_oid in lane_out_targets.values():
+                if len(targets_by_oid) == 1:
+                    only_oid, target_lanes = next(iter(targets_by_oid.items()))
+                    excl_pockets_by_edge[only_oid].append(frozenset(target_lanes))
 
         self._edge_adj = {eid: tuple(sorted(targets)) for eid, targets in adj_sets.items()}
         self._reverse_edge_adj = {eid: tuple(sorted(srcs)) for eid, srcs in rev_sets.items()}
+        self._incoming_edge_target_lanes = {
+            eid: {src_eid: frozenset(t_set) for src_eid, t_set in src_map.items()}
+            for eid, src_map in inc_targets_by_edge.items()
+        }
+        self._outgoing_edge_source_lanes = {
+            eid: {dst_eid: frozenset(s_set) for dst_eid, s_set in dst_map.items()}
+            for eid, dst_map in out_sources_by_edge.items()
+        }
+        self._exclusive_pocket_target_lanes = {
+            eid: tuple(dict.fromkeys(p_list))
+            for eid, p_list in excl_pockets_by_edge.items()
+        }
 
     def _validate_incident_specs(self) -> None:
         for idx, inc in enumerate(self._scenario.incidents):
@@ -539,6 +575,21 @@ class SumoSimulationAdapter:
         )
         return obs_batch, gt_record
 
+    def _can_disallow_lane_safely(self, eid: str, trial_open_lanes: set[int]) -> bool:
+        """Verify passenger connectivity stays legal for all incoming/outgoing edges and turn pockets."""
+        if not trial_open_lanes:
+            return False
+        for target_lanes in self._incoming_edge_target_lanes.get(eid, {}).values():
+            if target_lanes.isdisjoint(trial_open_lanes):
+                return False
+        for source_lanes in self._outgoing_edge_source_lanes.get(eid, {}).values():
+            if source_lanes.isdisjoint(trial_open_lanes):
+                return False
+        for pocket_targets in self._exclusive_pocket_target_lanes.get(eid, ()):
+            if pocket_targets.isdisjoint(trial_open_lanes):
+                return False
+        return True
+
     def _sync_incidents(self, sim_time: float) -> None:
         """Apply or restore scheduled mid-episode lane closures and speed bottlenecks."""
         if not self._scenario.incidents:
@@ -554,6 +605,7 @@ class SumoSimulationAdapter:
 
         # Recompute closed lanes & speed overrides cleanly across all currently active incidents
         closed_lanes_by_edge: dict[str, set[int]] = defaultdict(set)
+        closed_lane_speed_by_edge: dict[tuple[str, int], float] = {}
         speed_override_by_edge: dict[str, float] = {}
         affected_edges: set[str] = set()
         for inc in self._scenario.incidents:
@@ -561,8 +613,12 @@ class SumoSimulationAdapter:
 
         for idx in sorted(desired_active):
             inc = self._scenario.incidents[idx]
+            bottleneck_spd = max(0.8, float(inc.reduced_speed_mps)) if inc.reduced_speed_mps is not None else 0.8
             for eid in inc.edge_ids:
-                closed_lanes_by_edge[eid].update(inc.closed_lane_indices)
+                for lidx in inc.closed_lane_indices:
+                    closed_lanes_by_edge[eid].add(lidx)
+                    prev_b = closed_lane_speed_by_edge.get((eid, lidx), bottleneck_spd)
+                    closed_lane_speed_by_edge[(eid, lidx)] = min(prev_b, bottleneck_spd)
                 if inc.reduced_speed_mps is not None:
                     prev_spd = speed_override_by_edge.get(eid, self._base_edge_max_speed[eid])
                     speed_override_by_edge[eid] = min(prev_spd, float(inc.reduced_speed_mps))
@@ -570,18 +626,37 @@ class SumoSimulationAdapter:
         for eid in sorted(affected_edges):
             n_lanes = self._edge_num_lanes[eid]
             closed_set = closed_lanes_by_edge.get(eid, set())
+            target_spd = speed_override_by_edge.get(eid, self._base_edge_max_speed[eid])
+            self._conn.edge.setMaxSpeed(eid, float(target_spd))
+
+            physically_open = {
+                lidx for lidx in range(n_lanes) if self._base_lane_allows_passenger.get((eid, lidx), True)
+            }
             open_count = 0
             for lidx in range(n_lanes):
                 lane_id = f"{eid}_{lidx}"
-                if lidx in closed_set:
-                    self._conn.lane.setDisallowed(lane_id, ["passenger"])
+                base_disallowed = list(self._base_lane_disallowed.get(lane_id, ()))
+                base_allows = self._base_lane_allows_passenger.get((eid, lidx), True)
+                lane_open_spd = float(
+                    speed_override_by_edge.get(eid, self._base_lane_max_speed.get(lane_id, target_spd))
+                )
+                if lidx in closed_set and base_allows:
+                    trial_open = physically_open - {lidx}
+                    if self._can_disallow_lane_safely(eid, trial_open):
+                        physically_open = trial_open
+                        self._conn.lane.setDisallowed(lane_id, ["passenger"])
+                        self._conn.lane.setMaxSpeed(lane_id, lane_open_spd)
+                    else:
+                        # Preserve legal turn-pocket / predecessor connectivity; enforce severe bottleneck
+                        self._conn.lane.setDisallowed(lane_id, base_disallowed)
+                        inc_lane_spd = max(0.8, closed_lane_speed_by_edge.get((eid, lidx), 0.8))
+                        self._conn.lane.setMaxSpeed(lane_id, float(inc_lane_spd))
                 else:
-                    self._conn.lane.setDisallowed(lane_id, list(self._base_lane_disallowed.get(lane_id, ())))
-                    open_count += 1
+                    self._conn.lane.setDisallowed(lane_id, base_disallowed)
+                    self._conn.lane.setMaxSpeed(lane_id, lane_open_spd)
+                    if base_allows:
+                        open_count += 1
             self._open_lanes_by_edge[eid] = open_count
-
-            target_spd = speed_override_by_edge.get(eid, self._base_edge_max_speed[eid])
-            self._conn.edge.setMaxSpeed(eid, float(target_spd))
 
         self._active_incident_indices = desired_active
 

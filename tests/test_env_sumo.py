@@ -576,6 +576,59 @@ def test_mid_episode_incident_and_onboard_rerouter_and_route_guard(tmp_path: Pat
             )
 
 
+def test_grid4x4_incident_onset_active_window_and_clearance_regression(tmp_path: Path) -> None:
+    """Verify grid4x4_incident preserves turn-pocket connectivity across t=120s onset -> t=260s clearance."""
+    base_cfg = load_scenario_config(
+        REPO_ROOT / "configs" / "scenarios" / "grid4x4_incident.json", repo_root=REPO_ROOT
+    )
+    # Run through t = 268.0s covering pre-incident (<120s), onset (120s), active window, and clearance (260s+)
+    inc_cfg = replace(base_cfg, cohort_duration_s=198.0, drain_duration_s=10.0)
+
+    with SumoSimulationAdapter(inc_cfg, seed=3000, work_dir=tmp_path / "inc_full", repo_root=REPO_ROOT) as adapter:
+        obs, gt = adapter.reset(seed=3000)
+        base_b1c1_spd = adapter._base_lane_max_speed["B1C1_0"]
+        base_b2c2_spd = adapter._base_lane_max_speed["B2C2_0"]
+        assert base_b1c1_spd > 13.0
+
+        saw_pre_incident = False
+        saw_incident_onset = False
+        saw_active_mid = False
+        saw_cleared = False
+
+        while obs.sim_time < 268.0:
+            # Broadcast elevated congestion costs on incident edges during active window to exercise live rerouting
+            b_costs = {"B1C1": 180.0, "B2C2": 180.0} if 120.0 <= obs.sim_time < 260.0 else None
+            obs, gt = adapter.step(_passive_action(obs.sim_time, broadcast_edge_costs=b_costs))
+            assert gt.collisions == 0
+            assert gt.teleports == 0
+
+            if obs.sim_time < 120.0:
+                assert obs.open_lanes_by_edge["B1C1"] == 2
+                assert obs.open_lanes_by_edge["B2C2"] == 2
+                assert float(adapter._conn.lane.getMaxSpeed("B1C1_0")) == pytest.approx(base_b1c1_spd)
+                saw_pre_incident = True
+            elif 120.0 <= obs.sim_time < 260.0:
+                if math.isclose(obs.sim_time, 120.0, abs_tol=1e-6):
+                    saw_incident_onset = True
+                if obs.sim_time >= 180.0:
+                    saw_active_mid = True
+                assert obs.open_lanes_by_edge["B1C1"] == 1
+                assert obs.open_lanes_by_edge["B2C2"] == 1
+                # Exclusive right-turn pockets (B0B1.105.00 -> B1C1_0, B1B2.105.00 -> B2C2_0) stay connected
+                assert "passenger" not in adapter._conn.lane.getDisallowed("B1C1_0")
+                assert "passenger" not in adapter._conn.lane.getDisallowed("B2C2_0")
+                assert float(adapter._conn.lane.getMaxSpeed("B1C1_0")) == pytest.approx(4.5)
+                assert float(adapter._conn.lane.getMaxSpeed("B2C2_0")) == pytest.approx(4.5)
+            else:
+                assert obs.open_lanes_by_edge["B1C1"] == 2
+                assert obs.open_lanes_by_edge["B2C2"] == 2
+                assert float(adapter._conn.lane.getMaxSpeed("B1C1_0")) == pytest.approx(base_b1c1_spd)
+                assert float(adapter._conn.lane.getMaxSpeed("B2C2_0")) == pytest.approx(base_b2c2_spd)
+                saw_cleared = True
+
+        assert saw_pre_incident and saw_incident_onset and saw_active_mid and saw_cleared
+
+
 def test_fail_loud_lifecycle_backend_and_ast_firewall(tmp_path: Path) -> None:
     cfg = load_scenario_config(REPO_ROOT / "configs" / "scenarios" / "grid3x3_nominal.json", repo_root=REPO_ROOT)
 

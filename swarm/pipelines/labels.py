@@ -305,14 +305,22 @@ def compute_step_causal_labels(
             j_src = vb_src.in_junction_id or (spec_src.to_junction if spec_src is not None else None)
             j_dst = vb_dst.in_junction_id or (spec_dst.to_junction if spec_dst is not None else None)
             if j_src is not None and j_src == j_dst and j_src in topology.junctions:
-                out_src, opt_src = _realized_next_corridor(rv_src, cid_src, topology)
-                out_dst, opt_dst = _realized_next_corridor(rv_dst, cid_dst, topology)
+                out_src, opt_src = (
+                    _realized_next_corridor(rv_src, cid_src, topology)
+                    if spec_src is not None and spec_src.to_junction == j_src
+                    else (cid_src, None)
+                )
+                out_dst, opt_dst = (
+                    _realized_next_corridor(rv_dst, cid_dst, topology)
+                    if spec_dst is not None and spec_dst.to_junction == j_src
+                    else (cid_dst, None)
+                )
                 paths_conflict = False
                 if opt_src is not None and opt_dst is not None:
                     paths_conflict = topology.turn_conflict(j_src, opt_src, opt_dst) or (out_src == out_dst)
                 elif out_src is not None and out_src == out_dst:
                     paths_conflict = True
-                elif rv_src.road_id.startswith(":"):
+                elif rv_src.road_id.startswith(":") or vb_src.in_junction_id == j_src:
                     paths_conflict = True
 
                 if paths_conflict:

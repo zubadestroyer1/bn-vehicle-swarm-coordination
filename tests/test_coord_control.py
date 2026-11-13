@@ -57,12 +57,14 @@ from swarm.control import (
     run_damped_maxsum,
     verify_conflict_free_greens,
 )
+from swarm.control.scheduler import _pair_turn_conflict_prob
 from swarm.env.belief import CityBeliefTracker
 from swarm.logging_utils import (
     CheckpointIntegrityError,
     ConfigValidationError,
     DAGInvariantError,
     NumericalInvariantError,
+    TopologyIntegrityError,
 )
 
 
@@ -1169,3 +1171,81 @@ def test_boundary_lock_c_static_ast_firewall_on_swarm_control() -> None:
                 assert node.type is not None, f"Bare except prohibited in {py_path.name}"
                 has_raise = any(isinstance(sub, ast.Raise) for sub in ast.walk(node))
                 assert has_raise, f"Silent non-reraising except prohibited in {py_path.name}"
+
+
+def test_in_junction_clearing_guard_and_palo_alto_rush_rollout(tmp_path: Path) -> None:
+    """Verify clearing-vehicle outgoing-corridor guard (t=0..65s+ on osm_palo_alto_rush) & loud mismatch check."""
+    topology = _build_multi_link_test_topology()
+    v_approach = _make_vehicle_belief("v_app", "C_N_in", "e_N_in", free_eta_s=2.0)
+    # Actively clearing J_center into outgoing C_E_conn (whose to_junction is J_east != J_center)
+    v_clearing = _make_vehicle_belief(
+        "v_clr",
+        "C_E_conn",
+        "e_E_trunk",
+        turn_probs=(1.0,),
+        free_eta_s=0.0,
+        in_junction_id="J_center",
+    )
+    assert _pair_turn_conflict_prob(
+        topology,
+        "J_center",
+        v_approach,
+        topology.corridors["C_N_in"],
+        v_clearing,
+        topology.corridors["C_E_conn"],
+    ) == pytest.approx(1.0)
+
+    # Non-clearing vehicle on C_E_conn passed against J_center MUST fail loudly with TopologyIntegrityError
+    v_mismatch = _make_vehicle_belief(
+        "v_mis",
+        "C_E_conn",
+        "e_E_trunk",
+        turn_probs=(1.0,),
+        free_eta_s=2.0,
+        in_junction_id=None,
+    )
+    with pytest.raises(TopologyIntegrityError):
+        _pair_turn_conflict_prob(
+            topology,
+            "J_center",
+            v_approach,
+            topology.corridors["C_N_in"],
+            v_mismatch,
+            topology.corridors["C_E_conn"],
+        )
+
+    # Full closed-loop SUMO rollout on osm_palo_alto_rush across t = 0..65s+ with FactoredSwarmCoordinator
+    from swarm.config import load_scenario_config
+    from swarm.env import SumoSimulationAdapter, load_or_build_topology
+
+    repo_root = Path(__file__).resolve().parents[1]
+    pa_cfg = load_scenario_config(repo_root / "configs" / "scenarios" / "osm_palo_alto_rush.json", repo_root=repo_root)
+    pa_topo = load_or_build_topology(pa_cfg, repo_root=repo_root)
+    exp_cfg = ExperimentConfig(scenario=pa_cfg)
+    controller = build_policy_controller("heuristic_radius_dbn", pa_topo, config=exp_cfg, seed=3000)
+
+    saw_clearing_in_junction = False
+    with SumoSimulationAdapter(
+        pa_cfg,
+        control_config=exp_cfg.control,
+        policy_name="heuristic_radius_dbn",
+        seed=3000,
+        work_dir=tmp_path / "pa_ctrl",
+        repo_root=repo_root,
+        topology=pa_topo,
+    ) as adapter:
+        obs, gt = adapter.reset(seed=3000)
+        while obs.sim_time < 65.0:
+            if any(r.in_junction_id is not None for r in obs.radar_obs):
+                saw_clearing_in_junction = True
+            act = controller.act(obs)
+            assert act.tls_desired_greens is not None
+            for tls_id, g_links in act.tls_desired_greens.items():
+                junc = next(j for j in pa_topo.junctions.values() if j.tls_id == tls_id)
+                verify_conflict_free_greens(junc, frozenset(g_links))
+            obs, gt = adapter.step(act)
+            assert gt.collisions == 0
+            assert gt.teleports == 0
+
+    assert saw_clearing_in_junction
+

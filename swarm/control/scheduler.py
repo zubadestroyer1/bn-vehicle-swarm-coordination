@@ -123,9 +123,44 @@ def _pair_turn_conflict_prob(
     corr_b: CorridorSpec,
 ) -> float:
     """Compute belief-expected turn conflict probability ``P(conflict(a, b))`` at ``junction_id``."""
+    a_clearing = veh_a.in_junction_id == junction_id and corr_a.to_junction != junction_id
+    b_clearing = veh_b.in_junction_id == junction_id and corr_b.to_junction != junction_id
+    if a_clearing or b_clearing:
+        # Vehicle actively clearing `junction_id` into outgoing `corr`: conservatively hold
+        # approaching vehicles without indexing downstream `corr.turn_options` at `junction_id`.
+        return 1.0
+    if corr_a.to_junction != junction_id:
+        raise TopologyIntegrityError(
+            f"Vehicle {veh_a.veh_id!r} corridor {corr_a.corridor_id!r} targets junction "
+            f"{corr_a.to_junction!r}, not {junction_id!r} (in_junction_id={veh_a.in_junction_id!r}).",
+            context={
+                "junction_id": junction_id,
+                "veh_id": veh_a.veh_id,
+                "corridor_id": corr_a.corridor_id,
+                "corridor_to_junction": corr_a.to_junction,
+                "in_junction_id": veh_a.in_junction_id,
+            },
+        )
+    if corr_b.to_junction != junction_id:
+        raise TopologyIntegrityError(
+            f"Vehicle {veh_b.veh_id!r} corridor {corr_b.corridor_id!r} targets junction "
+            f"{corr_b.to_junction!r}, not {junction_id!r} (in_junction_id={veh_b.in_junction_id!r}).",
+            context={
+                "junction_id": junction_id,
+                "veh_id": veh_b.veh_id,
+                "corridor_id": corr_b.corridor_id,
+                "corridor_to_junction": corr_b.to_junction,
+                "in_junction_id": veh_b.in_junction_id,
+            },
+        )
     if not corr_a.turn_options or not corr_b.turn_options:
         return 0.0
-    if corr_a.corridor_id == corr_b.corridor_id and veh_a.lane_index == veh_b.lane_index:
+    if (
+        veh_a.in_junction_id is None
+        and veh_b.in_junction_id is None
+        and corr_a.corridor_id == corr_b.corridor_id
+        and veh_a.lane_index == veh_b.lane_index
+    ):
         # Same-lane longitudinal headway (idm_time_headway_s) is enforced directly on lane leaders.
         return 0.0
     total = 0.0
