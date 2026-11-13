@@ -413,6 +413,7 @@ def _run_post_transformer_cpd_lbp(
     training: bool,
     dag_temperature: float,
     dev: torch.device,
+    check_invariants: bool = True,
 ) -> DifferentiableStepOutput:
     """Shared FP32 CPD parameterization, DAG pruning, and multiplicative sum-product LBP stage."""
     with torch.autocast(device_type=dev.type, enabled=False):
@@ -428,6 +429,7 @@ def _run_post_transformer_cpd_lbp(
             turn_out_c_idx,
             turn_prob.float(),
             n_v,
+            check_invariants=check_invariants,
         )
 
         if use_static_cpd:
@@ -452,6 +454,7 @@ def _run_post_transformer_cpd_lbp(
             prev_delay_post=prev_delay_t.float(),
             spill_weight=spill_w_t,
             expected_down_spill=exp_down_spill,
+            check_invariants=check_invariants,
         )
 
         pruned = gate_and_prune_edges(
@@ -465,6 +468,7 @@ def _run_post_transformer_cpd_lbp(
             min_edge_prob=dbn_cfg.min_edge_prob,
             training=training,
             dag_temperature=dag_temperature,
+            check_invariants=check_invariants,
         )
 
         lbp_res = multiplicative_sum_product_lbp(
@@ -473,6 +477,7 @@ def _run_post_transformer_cpd_lbp(
             speed_evidence_pos=ev_pos.float(),
             lbp_sweeps=dbn_cfg.lbp_sweeps,
             lbp_damping=dbn_cfg.lbp_damping,
+            check_invariants=check_invariants,
         )
 
         delay_pred_logits_scaled = lbp_res.delay_pred_logits / float(temps.t_delay)
@@ -484,8 +489,9 @@ def _run_post_transformer_cpd_lbp(
             delay_pred_cal = torch.sigmoid(delay_pred_logits_scaled)
             delay_post_cal = torch.sigmoid(delay_post_logits_scaled)
 
-        require_probability_range(delay_pred_cal, "forward_dbn_step.delay_pred")
-        require_probability_range(delay_post_cal, "forward_dbn_step.delay_post")
+        if check_invariants:
+            require_probability_range(delay_pred_cal, "forward_dbn_step.delay_pred")
+            require_probability_range(delay_post_cal, "forward_dbn_step.delay_post")
 
     return DifferentiableStepOutput(
         transformer_out=tf_out,
@@ -666,6 +672,7 @@ def forward_dbn_precomputed_step(
     use_static_cpd: bool = False,
     reset_temporal_prior: bool = False,
     dag_temperature: float = 0.50,
+    check_invariants: bool = False,
 ) -> DifferentiableStepOutput:
     """Execute one zero-Python-loop differentiable DBN step on pre-staged device tensors."""
     temps = temperatures if temperatures is not None else TemperatureScales.uncalibrated_unit()
@@ -706,6 +713,7 @@ def forward_dbn_precomputed_step(
                 pers_m,
                 prior_stay_prob=dbn_cfg.prior_stay_prob,
                 prior_base_prob=dbn_cfg.prior_base_prob,
+                check_invariants=check_invariants,
             )  # type: ignore[assignment]
         else:
             prior_edge_t = step.base_prior_edge_prob
@@ -739,6 +747,7 @@ def forward_dbn_precomputed_step(
         edge_prev_idx=step.edge_prev_idx,
         edge_same=step.edge_same,
         skip_edge_keys=True,
+        check_invariants=check_invariants,
     )
 
     return _run_post_transformer_cpd_lbp(
@@ -757,6 +766,7 @@ def forward_dbn_precomputed_step(
         training=bool(model.training),
         dag_temperature=dag_temperature,
         dev=dev,
+        check_invariants=check_invariants,
     )
 
 

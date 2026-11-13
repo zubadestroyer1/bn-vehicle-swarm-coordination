@@ -2043,3 +2043,361 @@ def test_vectorized_precomputed_unrolled_matches_reference_loss_and_grads() -> N
             checked_grads += 1
     assert checked_grads > 0
 
+
+def test_disjoint_supergraph_batch_matches_sequential_loss_and_grads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify Disjoint-Union Super-Graph batching (batch_size=8) matches sequential loss & grads (< 1e-5) with 0 inner syncs."""
+    import copy
+
+    from swarm.dbn.calibration import TemperatureScales
+    from swarm.dbn.features import FeatureNormalizer
+    from swarm.dbn.transformer import STGraphTransformerDBN
+    from swarm.dbn.updater import forward_dbn_precomputed_step
+    from swarm.pipelines.trainer import (
+         RolloutSequenceDataset,
+        _LOSS_COMPONENT_KEYS,
+        _build_vector_carries,
+        _evaluate_validation_episodes,
+        collate_precomputed_window_batch,
+        compute_precomputed_step_loss,
+        prestage_rollout_dataset,
+    )
+
+    def _run_equivalence_check(
+        shards: list[dict[str, Any]],
+        *,
+        preset_name: str,
+        window_len: int,
+        stride: int,
+        eff_burn: int,
+        batch_size: int = 8,
+    ) -> tuple[float, float]:
+        dbn_cfg = DBNConfig(model_preset=preset_name)  # type: ignore[arg-type]
+        train_cfg = TrainConfig(model_preset=preset_name, batch_size=batch_size, seed=2026)  # type: ignore[arg-type]
+        dataset = RolloutSequenceDataset(shards, dbn_cfg=dbn_cfg, window_len=window_len, stride=stride)
+        assert len(dataset) >= batch_size
+
+        normalizer = FeatureNormalizer().fit(dataset.all_feature_batches())
+        device = torch.device("cpu")
+        prestaged = prestage_rollout_dataset(dataset, normalizer, device)
+
+        # Pick batch_size windows interleaved across episodes to maximize heterogeneity
+        win_indices = [
+            int(round(i * (len(dataset) - 1) / max(1, batch_size - 1)))
+            for i in range(batch_size)
+        ]
+        batch_wins = [
+            prestaged[dataset.windows[w_idx][0]][dataset.windows[w_idx][1] : dataset.windows[w_idx][2]]
+            for w_idx in win_indices
+        ]
+        assert len(batch_wins) == batch_size
+        assert all(len(w) == window_len for w in batch_wins)
+
+        torch.manual_seed(777)
+        model_seq = STGraphTransformerDBN(
+            preset=preset_name,  # type: ignore[arg-type]
+            prediction_horizon_s=dbn_cfg.prediction_horizon_s,
+        ).to(device)
+        model_sup = copy.deepcopy(model_seq).to(device)
+        model_seq.train()
+        model_sup.train()
+        # Keep model.training=True (smooth DAG gating + BPTT) while making Dropout deterministic
+        for m in (model_seq, model_sup):
+            for mod in m.modules():
+                if isinstance(mod, torch.nn.Dropout):
+                    mod.p = 0.0
+
+        dag_temp = 0.35
+        temps = TemperatureScales.uncalibrated_unit()
+        n_sup = window_len - eff_burn
+
+        # 1. Sequential single-window loop (Stage 1 reference: B separate forwards + B separate backwards)
+        seq_loss_sum = 0.0
+        seq_parts_accum = torch.zeros((len(_LOSS_COMPONENT_KEYS),), dtype=torch.float32, device=device)
+        for win in batch_wins:
+            prev_mem = None
+            prev_delay = None
+            prev_omega = None
+            prev_omega_det = None
+            if eff_burn > 0:
+                with torch.no_grad():
+                    for s_i in range(eff_burn):
+                        out_b = forward_dbn_precomputed_step(
+                            model=model_seq,
+                            step=win[s_i].inputs,
+                            dbn_cfg=dbn_cfg,
+                            temperatures=temps,
+                            prev_memory=prev_mem,
+                            prev_delay_vec=prev_delay,
+                            prev_omega_vec=prev_omega,
+                            dag_temperature=dag_temp,
+                        )
+                        prev_mem, prev_delay, prev_omega, prev_omega_det = _build_vector_carries(
+                            out_b, detach=True
+                        )
+            w_loss_acc = torch.zeros((), dtype=torch.float32, device=device)
+            w_parts_acc = torch.zeros((len(_LOSS_COMPONENT_KEYS),), dtype=torch.float32, device=device)
+            for s_i in range(eff_burn, window_len):
+                out_s = forward_dbn_precomputed_step(
+                    model=model_seq,
+                    step=win[s_i].inputs,
+                    dbn_cfg=dbn_cfg,
+                    temperatures=temps,
+                    prev_memory=prev_mem,
+                    prev_delay_vec=prev_delay,
+                    prev_omega_vec=prev_omega,
+                    dag_temperature=dag_temp,
+                )
+                s_loss, s_parts = compute_precomputed_step_loss(
+                    step_out=out_s,
+                    pstep=win[s_i],
+                    train_cfg=train_cfg,
+                    prev_omega_det_vec=prev_omega_det,
+                    device=device,
+                )
+                w_loss_acc = w_loss_acc + s_loss
+                w_parts_acc = w_parts_acc + s_parts
+                prev_mem, prev_delay, prev_omega, prev_omega_det = _build_vector_carries(
+                    out_s, detach=False
+                )
+            mean_w_loss = w_loss_acc / float(n_sup)
+            (mean_w_loss / float(batch_size)).backward()
+            seq_loss_sum += float(mean_w_loss.detach().item())
+            seq_parts_accum = seq_parts_accum + (w_parts_acc / float(n_sup))
+
+        mean_seq_loss = seq_loss_sum / float(batch_size)
+        mean_seq_parts = seq_parts_accum / float(batch_size)
+
+        # 2. Disjoint-Union Super-Graph batch (Stage 2: ONE collated trajectory + ONE backward + ZERO .item() syncs)
+        super_win = collate_precomputed_window_batch(batch_wins)
+        orig_item = torch.Tensor.item
+        item_sync_calls = 0
+
+        def _counting_item(self_t: torch.Tensor) -> Any:
+            nonlocal item_sync_calls
+            item_sync_calls += 1
+            return orig_item(self_t)
+
+        with monkeypatch.context() as mp:
+            mp.setattr(torch.Tensor, "item", _counting_item)
+            prev_mem_g = None
+            prev_delay_g = None
+            prev_omega_g = None
+            prev_omega_det_g = None
+            if eff_burn > 0:
+                with torch.no_grad():
+                    for s_i in range(eff_burn):
+                        out_bg = forward_dbn_precomputed_step(
+                            model=model_sup,
+                            step=super_win[s_i].inputs,
+                            dbn_cfg=dbn_cfg,
+                            temperatures=temps,
+                            prev_memory=prev_mem_g,
+                            prev_delay_vec=prev_delay_g,
+                            prev_omega_vec=prev_omega_g,
+                            dag_temperature=dag_temp,
+                        )
+                        prev_mem_g, prev_delay_g, prev_omega_g, prev_omega_det_g = _build_vector_carries(
+                            out_bg, detach=True
+                        )
+
+            sup_loss_acc = torch.zeros((), dtype=torch.float32, device=device)
+            sup_parts_acc = torch.zeros((len(_LOSS_COMPONENT_KEYS),), dtype=torch.float32, device=device)
+            for s_i in range(eff_burn, window_len):
+                out_sg = forward_dbn_precomputed_step(
+                    model=model_sup,
+                    step=super_win[s_i].inputs,
+                    dbn_cfg=dbn_cfg,
+                    temperatures=temps,
+                    prev_memory=prev_mem_g,
+                    prev_delay_vec=prev_delay_g,
+                    prev_omega_vec=prev_omega_g,
+                    dag_temperature=dag_temp,
+                )
+                sg_loss, sg_parts = compute_precomputed_step_loss(
+                    step_out=out_sg,
+                    pstep=super_win[s_i],
+                    train_cfg=train_cfg,
+                    prev_omega_det_vec=prev_omega_det_g,
+                    device=device,
+                )
+                sup_loss_acc = sup_loss_acc + sg_loss
+                sup_parts_acc = sup_parts_acc + sg_parts
+                prev_mem_g, prev_delay_g, prev_omega_g, prev_omega_det_g = _build_vector_carries(
+                    out_sg, detach=False
+                )
+            mean_sup_loss_t = sup_loss_acc / float(n_sup)
+            mean_sup_loss_t.backward()
+
+        assert item_sync_calls == 0, f"Expected 0 .item() syncs in super-graph step/backward, got {item_sync_calls}"
+
+        mean_sup_loss = float(mean_sup_loss_t.detach().item())
+        mean_sup_parts = sup_parts_acc / float(n_sup)
+        loss_diff = abs(mean_sup_loss - mean_seq_loss)
+        assert loss_diff < 1e-5, f"Super-graph loss mismatch ({preset_name}): {loss_diff}"
+
+        for idx_k, key in enumerate(_LOSS_COMPONENT_KEYS):
+            c_diff = abs(float(mean_sup_parts[idx_k].item()) - float(mean_seq_parts[idx_k].item()))
+            assert c_diff < 1e-5, f"Super-graph component {key} mismatch ({preset_name}): {c_diff}"
+
+        max_grad_diff = 0.0
+        for (n1, p1), (n2, p2) in zip(
+            model_seq.named_parameters(), model_sup.named_parameters(), strict=True
+        ):
+            assert n1 == n2
+            assert (p1.grad is None) == (p2.grad is None), f"Grad presence mismatch on {n1}"
+            if p1.grad is not None and p2.grad is not None:
+                g_diff = float((p1.grad - p2.grad).abs().max().item())
+                max_grad_diff = max(max_grad_diff, g_diff)
+                assert g_diff < 1e-5, f"Super-graph grad mismatch on {n1} ({preset_name}): {g_diff}"
+
+        # 3. Verify batched hard-DAG validation (_evaluate_validation_episodes eval_batch_size=8 vs 1)
+        val_seq, logits_seq = _evaluate_validation_episodes(
+            raw_model=model_seq,
+            normalizer=normalizer,
+            val_dataset=dataset,
+            train_cfg=train_cfg,
+            dbn_cfg=dbn_cfg,
+            device=device,
+            collect_logits=True,
+            prestaged_episodes=prestaged,
+            eval_batch_size=1,
+        )
+        val_bat, logits_bat = _evaluate_validation_episodes(
+            raw_model=model_seq,
+            normalizer=normalizer,
+            val_dataset=dataset,
+            train_cfg=train_cfg,
+            dbn_cfg=dbn_cfg,
+            device=device,
+            collect_logits=True,
+            prestaged_episodes=prestaged,
+            eval_batch_size=8,
+        )
+        for k in _LOSS_COMPONENT_KEYS:
+            v_diff = abs(val_bat[k] - val_seq[k])
+            assert v_diff < 1e-5, f"Batched validation {k} mismatch: {v_diff}"
+        for lk in logits_seq:
+            assert logits_bat[lk].shape == logits_seq[lk].shape
+            assert abs(float(np.mean(logits_bat[lk])) - float(np.mean(logits_seq[lk]))) < 1e-5
+
+        return loss_diff, max_grad_diff
+
+    # Part A: Portable heterogeneous synthetic shards (different N_v, E_t, E_t=0 steps, rank pairs, vehicle churn)
+    synth_shards: list[dict[str, Any]] = []
+    for ep_i in range(4):
+        rng = np.random.default_rng(9100 + ep_i)
+        n_c = 3 + (ep_i % 2)
+        c_ids = tuple(f"C{c}" for c in range(n_c))
+        c_edges = torch.tensor([[c for c in range(n_c - 1)], [c + 1 for c in range(n_c - 1)]], dtype=torch.long)
+        ep_steps: list[dict[str, Any]] = []
+        for s_i in range(8):
+            n_v = 4 + ((ep_i * 2 + s_i) % 5)
+            v_ids = tuple(f"ep{ep_i}_v{(s_i + j) % (n_v + 2)}" for j in range(n_v))
+            if ep_i == 2 and s_i == 4:
+                pairs: list[tuple[int, int]] = []
+            else:
+                pairs = [(j, (j + 1) % n_v) for j in range(n_v - 1)]
+                if n_v >= 4:
+                    pairs.append((0, n_v - 1))
+            e_cand = len(pairs)
+            x_v = rng.normal(0.0, 0.5, size=(n_v, NODE_FEATURE_DIM)).astype(np.float32)
+            x_v[:, 13] = np.clip(rng.uniform(0.05, 0.90, size=n_v), 0.01, 0.99).astype(np.float32)
+            x_c = rng.normal(0.0, 0.4, size=(n_c, CORRIDOR_FEATURE_DIM)).astype(np.float32)
+            x_c[:, 5:11] = np.clip(rng.uniform(0.05, 0.90, size=(n_c, 6)), 0.01, 0.99).astype(np.float32)
+            x_cc = rng.uniform(0.1, 0.9, size=(n_c - 1, CORRIDOR_EDGE_FEATURE_DIM)).astype(np.float32)
+            if e_cand > 0:
+                edge_idx = torch.tensor([[p[0] for p in pairs], [p[1] for p in pairs]], dtype=torch.long)
+                edge_rel = torch.tensor([k % 4 for k in range(e_cand)], dtype=torch.long)
+                x_e = rng.normal(0.0, 0.4, size=(e_cand, EDGE_FEATURE_DIM)).astype(np.float32)
+                x_e[:, :4] = 0.0
+                for k, r_id in enumerate(edge_rel.tolist()):
+                    x_e[k, r_id] = 1.0
+                x_e[:, 8:10] = np.clip(rng.uniform(0.1, 0.9, size=(e_cand, 2)), 0.0, 1.0).astype(np.float32)
+                x_e[:, 15] = np.clip(rng.uniform(0.05, 0.85, size=e_cand), 0.0, 1.0).astype(np.float32)
+                x_e[:, 17] = (rng.uniform(0.0, 1.0, size=e_cand) > 0.4).astype(np.float32)
+                y_edge = torch.from_numpy((rng.uniform(0.0, 1.0, size=e_cand) > (0.2 + 0.15 * ep_i)).astype(np.float32))
+            else:
+                edge_idx = torch.zeros((2, 0), dtype=torch.long)
+                edge_rel = torch.zeros((0,), dtype=torch.long)
+                x_e = np.zeros((0, EDGE_FEATURE_DIM), dtype=np.float32)
+                y_edge = torch.zeros((0,), dtype=torch.float32)
+
+            y_delay = torch.from_numpy((rng.uniform(0.0, 1.0, size=n_v) > (0.25 + 0.15 * ep_i)).astype(np.float32))
+            tau_delay = y_delay * 3.5 + torch.from_numpy(rng.uniform(0.0, 0.7, size=n_v).astype(np.float32))
+            y_spill = torch.from_numpy((rng.uniform(0.0, 1.0, size=n_c) > 0.5).astype(np.float32))
+            rank_pairs = (
+                torch.zeros((0, 2), dtype=torch.long)
+                if (ep_i == 1 and s_i == 3)
+                else torch.tensor([[0, n_v - 1], [1, n_v - 2]], dtype=torch.long)
+            )
+            ep_steps.append(
+                {
+                    "sim_time": float(30.0 + s_i * 0.5),
+                    "veh_ids": v_ids,
+                    "veh_corridor_idx": torch.tensor([j % n_c for j in range(n_v)], dtype=torch.long),
+                    "veh_turn_src_idx": torch.tensor([0, 1], dtype=torch.long),
+                    "veh_turn_out_corridor_idx": torch.tensor([1 % n_c, 2 % n_c], dtype=torch.long),
+                    "veh_turn_prob": torch.ones((2,), dtype=torch.float32),
+                    "topo_precedence": torch.from_numpy(np.linspace(3.5, -3.5, n_v, dtype=np.float32)),
+                    "speed_evidence_pos": torch.from_numpy(rng.uniform(0.15, 0.85, size=n_v).astype(np.float32)),
+                    "x_veh": torch.from_numpy(x_v),
+                    "x_corridor": torch.from_numpy(x_c),
+                    "x_edge": torch.from_numpy(x_e),
+                    "x_corridor_edge": torch.from_numpy(x_cc),
+                    "edge_index": edge_idx,
+                    "edge_relations": edge_rel,
+                    "y_delay": y_delay,
+                    "tau_delay_s": tau_delay,
+                    "y_spillback": y_spill,
+                    "y_edge": y_edge,
+                    "rank_pairs": rank_pairs,
+                }
+            )
+        synth_shards.append(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "split": "train",
+                "scenario_id": "grid3x3_nominal",
+                "network_id": "grid3x3",
+                "seed": TRAIN_SEEDS[ep_i],
+                "behavior_policy": "online_bic_dbn",
+                "dt": 0.5,
+                "corridor_ids": c_ids,
+                "corridor_edge_index": c_edges,
+                "steps": ep_steps,
+            }
+        )
+
+    _run_equivalence_check(
+        synth_shards,
+        preset_name="ci_micro",
+        window_len=5,
+        stride=2,
+        eff_burn=1,
+        batch_size=8,
+    )
+
+    # Part B: Real SUMO rollout shards (sota_local, exact window_len=10/eff_burn=2, batch_size=8 across 3 scenarios)
+    real_manifest_path = REPO_ROOT / "outputs" / "rollouts" / "train" / "manifest.json"
+    if real_manifest_path.is_file():
+        manifest_obj = json.loads(real_manifest_path.read_text(encoding="utf-8"))
+        real_shards: list[dict[str, Any]] = []
+        for rec in manifest_obj["shards"][:4]:
+            s_path = real_manifest_path.parent / str(rec["shard_file"])
+            assert file_sha256(s_path) == rec["shard_sha256"]
+            loaded = dict(torch.load(s_path, map_location="cpu", weights_only=True))
+            loaded["steps"] = list(loaded["steps"][:16])
+            real_shards.append(loaded)
+
+        _run_equivalence_check(
+            real_shards,
+            preset_name="sota_local",
+            window_len=10,
+            stride=4,
+            eff_burn=2,
+            batch_size=8,
+        )
+
+

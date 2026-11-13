@@ -723,6 +723,7 @@ class STGraphTransformerDBN(nn.Module):
         edge_prev_idx: Tensor | None = None,
         edge_same: bool = False,
         skip_edge_keys: bool = False,
+        check_invariants: bool = True,
     ) -> TransformerStepOutputs:
         """Execute one full spatio-temporal forward pass of ``STGraphTransformerDBN``."""
         n_v = z_veh.shape[0]
@@ -926,17 +927,20 @@ class STGraphTransformerDBN(nn.Module):
         # 6. Hybrid Physical + Neural Corridor Spillback Logits (promoted to FP32)
         if n_c > 0:
             with torch.autocast(device_type=device.type, enabled=False):
-                phys_logits = self.phys_corridor_cpd(x_corridor_raw.float()).float()
+                phys_logits = self.phys_corridor_cpd(
+                    x_corridor_raw.float(), check_invariants=check_invariants
+                ).float()
             neural_res = self.corridor_res_head(nc_out).squeeze(-1).float()
             corridor_spillback_logits = phys_logits + neural_res
         else:
             corridor_spillback_logits = torch.empty((0,), device=device, dtype=torch.float32)
 
         # Post-forward numerical guards
-        require_finite(precedence, "STGraphTransformerDBN.precedence")
-        require_finite(edge_logits, "STGraphTransformerDBN.edge_logits")
-        require_finite(corridor_spillback_logits, "STGraphTransformerDBN.corridor_spillback_logits")
-        require_finite(expected_delay_s, "STGraphTransformerDBN.expected_delay_s")
+        if check_invariants:
+            require_finite(precedence, "STGraphTransformerDBN.precedence")
+            require_finite(edge_logits, "STGraphTransformerDBN.edge_logits")
+            require_finite(corridor_spillback_logits, "STGraphTransformerDBN.corridor_spillback_logits")
+            require_finite(expected_delay_s, "STGraphTransformerDBN.expected_delay_s")
 
         # Update stored hidden states in FP32 with post-transformer contextualized residuals for next tick
         next_mem = TorchTemporalMemory(

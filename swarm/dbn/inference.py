@@ -103,6 +103,8 @@ def compute_cascade_scores(
     dst_idx: Tensor,
     cavity_survival: Tensor,
     phi_1: Tensor,
+    *,
+    check_invariants: bool = True,
 ) -> Tensor:
     """Compute 2-hop causal downstream cascade impact ``psi_cascade [N_t] >= 0`` in ``O(|E_act|)``.
 
@@ -121,7 +123,8 @@ def compute_cascade_scores(
 
     two_hop_edge = edge_impact * (1.0 + hop_1.index_select(0, dst_idx))
     cascade = edge_impact.new_zeros((num_vehicles,)).index_add(0, src_idx, two_hop_edge)
-    require_finite(cascade, "compute_cascade_scores.cascade")
+    if check_invariants:
+        require_finite(cascade, "compute_cascade_scores.cascade")
     return cascade
 
 
@@ -132,6 +135,7 @@ def multiplicative_sum_product_lbp(
     *,
     lbp_sweeps: int = 3,
     lbp_damping: float = 0.50,
+    check_invariants: bool = True,
 ) -> LBPInferenceResult:
     """Run deterministic Division-Free Prefix-Suffix Multiplicative Sum-Product LBP.
 
@@ -151,8 +155,9 @@ def multiplicative_sum_product_lbp(
     num_vehicles = pruned_dag.num_vehicles
     require_shape(base_survival_z0, (num_vehicles,), "lbp.base_survival_z0")
     require_shape(speed_evidence_pos, (num_vehicles,), "lbp.speed_evidence_pos")
-    require_probability_range(base_survival_z0, "lbp.base_survival_z0")
-    require_probability_range(speed_evidence_pos, "lbp.speed_evidence_pos")
+    if check_invariants:
+        require_probability_range(base_survival_z0, "lbp.base_survival_z0")
+        require_probability_range(speed_evidence_pos, "lbp.speed_evidence_pos")
 
     if lbp_sweeps < 1:
         raise NumericalInvariantError(
@@ -206,6 +211,7 @@ def multiplicative_sum_product_lbp(
     phi_1_pad = pruned_dag.phi_1_padded           # [N_t, K_max]
     src_act = pruned_dag.src_idx                  # [E_act]
     dst_act = pruned_dag.dst_idx                  # [E_act]
+    dst_rank = pruned_dag.dst_rank                # [E_act]
 
     # 1. Causal Prior Pass (delay_pred before current-tick speed evidence):
     # Under uniform local evidence, diagnostic messages are identically flat (d-separation),
@@ -223,21 +229,7 @@ def multiplicative_sum_product_lbp(
         p_prior = (1.0 - base_survival_z0 * prod_c).clamp(min=0.0, max=1.0)
     delay_pred = p_prior
 
-    # 2. Build padded outgoing child-slot layout [N_t, D_out_max] once per graph for
-    #    division-free outgoing child-message cavity products!
-    sort_out_key = src_act * num_vehicles + dst_act
-    out_perm = torch.argsort(sort_out_key, stable=True)
-    sorted_src = src_act.index_select(0, out_perm)
-    out_counts = torch.bincount(sorted_src, minlength=num_vehicles)
-    d_out_max = max(1, int(out_counts.max().item()))
-    out_starts = torch.cumsum(out_counts, dim=0) - out_counts
-    out_ranks_sorted = torch.arange(e_act, dtype=torch.long, device=device) - out_starts.index_select(0, sorted_src)
-
-    # Map each active edge position e in [0..E_act-1] to its outgoing slot (src_act[e], edge_out_rank[e])
-    edge_out_rank = torch.zeros((e_act,), dtype=torch.long, device=device)
-    edge_out_rank.scatter_(0, out_perm, out_ranks_sorted)
-
-    # Initialize messages on active edges:
+    # 2. Initialize messages on active edges (zero host-device syncs, pure O(|E_act|) scatter/gather):
     # - mu_var_to_fac_p1 [E_act]: P(D_j = 1) sent from variable j to child factor f_i
     # - lam_fac_to_var   [E_act, 2]: normalized diagnostic likelihood (lam_0, lam_1) from f_i to parent j
     init_node_post = (ev_1 * delay_pred) / (ev_0 * (1.0 - delay_pred) + ev_1 * delay_pred + 1e-12)
@@ -282,28 +274,55 @@ def multiplicative_sum_product_lbp(
         lam_slot_sum = (lam_slot_0 + lam_slot_1).clamp(min=1e-12)
         lam_hat_p1_slots = lam_slot_1 / lam_slot_sum
 
-        # Gather active edges from padded [N_t, K_max] slots back to [E_act]
-        # Each active edge e sits at (dst_act[e], rank_in_dst[e]); even faster: compute directly on [E_act]!
-        # Wait: let's extract s_cavity_edge [E_act] cleanly via p_edge_pos scatter!
-        lam_hat_p1_edge = torch.zeros((e_act,), dtype=dtype, device=device).scatter(
-            0, p_edge_pos[p_mask], lam_hat_p1_slots[p_mask]
-        )
+        # Gather active edges directly from padded [N_t, K_max] slots at (dst_act, dst_rank)
+        lam_hat_p1_edge = lam_hat_p1_slots[dst_act, dst_rank]
 
         lam_prev_p1 = lam_edge[:, 1]
         lam_new_p1 = _multiplicative_damp_prob(lam_prev_p1, lam_hat_p1_edge, lbp_damping)
         lam_edge = torch.stack([1.0 - lam_new_p1, lam_new_p1], dim=-1)
 
-        # Step C: Division-free outgoing child-cavity product across [N_t, D_out_max, 2]
-        #         (re-normalizing per slot so deep trees never underflow!)
-        out_lam_padded = torch.ones((num_vehicles, d_out_max, 2), dtype=dtype, device=device).index_put(
-            (src_act, edge_out_rank), lam_edge * 2.0
+        # Step C: Zero-sync O(|E_act|) division-free outgoing child-cavity product via
+        #         exact zero-counting + log-domain scatter-add (immune to underflow on deep/wide graphs)
+        zero_mask = lam_edge <= 1e-30
+        zero_count_edge = zero_mask.to(dtype=dtype)
+        safe_log_lam = torch.log(torch.where(zero_mask, torch.ones_like(lam_edge), lam_edge))
+
+        total_zeros = lam_edge.new_zeros((num_vehicles, 2)).index_add(0, src_act, zero_count_edge)
+        total_log_nz = lam_edge.new_zeros((num_vehicles, 2)).index_add(0, src_act, safe_log_lam)
+
+        valid_full = total_zeros < 0.5
+        neg_inf_full = torch.full_like(total_log_nz[:, 0], -1e30)
+        max_full_raw = torch.maximum(
+            torch.where(valid_full[:, 0], total_log_nz[:, 0], neg_inf_full),
+            torch.where(valid_full[:, 1], total_log_nz[:, 1], neg_inf_full),
         )
-        excl_out_lam, full_out_lam = _exclusive_prefix_suffix_1d_slots(out_lam_padded)
+        shift_full = (
+            torch.where(valid_full[:, 0] | valid_full[:, 1], max_full_raw, torch.zeros_like(max_full_raw))
+            .detach()
+            .unsqueeze(-1)
+        )
+        shifted_full = torch.where(valid_full, total_log_nz - shift_full, torch.zeros_like(total_log_nz))
+        full_out_lam = torch.where(valid_full, torch.exp(shifted_full), torch.zeros_like(total_log_nz))
 
         full_out_sum = (full_out_lam[:, 0] + full_out_lam[:, 1]).clamp(min=1e-12)
         all_child_lam = full_out_lam / full_out_sum.unsqueeze(-1)
 
-        excl_for_edge = excl_out_lam[src_act, edge_out_rank]  # [E_act, 2]
+        excl_zeros = total_zeros.index_select(0, src_act) - zero_count_edge
+        excl_log_nz = total_log_nz.index_select(0, src_act) - safe_log_lam
+        valid_excl = excl_zeros < 0.5
+        neg_inf_excl = torch.full_like(excl_log_nz[:, 0], -1e30)
+        max_excl_raw = torch.maximum(
+            torch.where(valid_excl[:, 0], excl_log_nz[:, 0], neg_inf_excl),
+            torch.where(valid_excl[:, 1], excl_log_nz[:, 1], neg_inf_excl),
+        )
+        shift_excl = (
+            torch.where(valid_excl[:, 0] | valid_excl[:, 1], max_excl_raw, torch.zeros_like(max_excl_raw))
+            .detach()
+            .unsqueeze(-1)
+        )
+        shifted_excl = torch.where(valid_excl, excl_log_nz - shift_excl, torch.zeros_like(excl_log_nz))
+        excl_for_edge = torch.where(valid_excl, torch.exp(shifted_excl), torch.zeros_like(excl_log_nz))
+
         mu_raw_0 = ev_0.index_select(0, src_act) * pi_node_0.index_select(0, src_act) * excl_for_edge[:, 0]
         mu_raw_1 = ev_1.index_select(0, src_act) * pi_node_1.index_select(0, src_act) * excl_for_edge[:, 1]
         mu_sum = (mu_raw_0 + mu_raw_1).clamp(min=1e-12)
@@ -322,9 +341,7 @@ def multiplicative_sum_product_lbp(
     pi_final_1 = (1.0 - pi_final_0).clamp(min=0.0, max=1.0)
 
     s_cavity_final_slots = (base_survival_z0.unsqueeze(1) * excl_c_final).clamp(min=0.0, max=1.0)
-    cavity_survival_edge = torch.zeros((e_act,), dtype=dtype, device=device).scatter(
-        0, p_edge_pos[p_mask], s_cavity_final_slots[p_mask]
-    )
+    cavity_survival_edge = s_cavity_final_slots[dst_act, dst_rank]
 
     post_0 = ev_0 * pi_final_0 * all_child_lam[:, 0]
     post_1 = ev_1 * pi_final_1 * all_child_lam[:, 1]
@@ -337,11 +354,13 @@ def multiplicative_sum_product_lbp(
         dst_idx=dst_act,
         cavity_survival=cavity_survival_edge,
         phi_1=pruned_dag.phi_1,
+        check_invariants=check_invariants,
     )
 
-    require_probability_range(delay_pred, "lbp.delay_pred")
-    require_probability_range(delay_post, "lbp.delay_post")
-    require_finite(cascade_score, "lbp.cascade_score")
+    if check_invariants:
+        require_probability_range(delay_pred, "lbp.delay_pred")
+        require_probability_range(delay_post, "lbp.delay_post")
+        require_finite(cascade_score, "lbp.cascade_score")
 
     return LBPInferenceResult(
         delay_pred=delay_pred,

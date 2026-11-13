@@ -42,6 +42,7 @@ def temporal_edge_prior(
     *,
     prior_stay_prob: float = 0.80,
     prior_base_prob: float = 0.10,
+    check_invariants: bool = True,
 ) -> Tensor | np.ndarray:
     """Compute first-order Markov edge prior ``P(e_{j->i}^t = 1 | omega_{j->i}^{t-1})``.
 
@@ -66,22 +67,25 @@ def temporal_edge_prior(
             f"prior_base_prob must be in (0, 1), got {prior_base_prob}.",
             context={"prior_base_prob": prior_base_prob},
         )
-    require_probability_range(prev_omega, "temporal_edge_prior.prev_omega")
-    require_probability_range(persisted_mask, "temporal_edge_prior.persisted_mask")
+    if check_invariants:
+        require_probability_range(prev_omega, "temporal_edge_prior.prev_omega")
+        require_probability_range(persisted_mask, "temporal_edge_prior.persisted_mask")
 
     persisted_prior = (1.0 - prior_stay_prob) * prior_base_prob + prior_stay_prob * prev_omega
     if isinstance(prev_omega, torch.Tensor):
         mask_t = torch.as_tensor(persisted_mask, dtype=prev_omega.dtype, device=prev_omega.device)
         base_t = torch.full_like(prev_omega, prior_base_prob)
         out = base_t + mask_t * (persisted_prior - base_t)
-        require_probability_range(out, "temporal_edge_prior.out")
+        if check_invariants:
+            require_probability_range(out, "temporal_edge_prior.out")
         return out
 
     mask_np = np.asarray(persisted_mask, dtype=np.float32)
     out_np = np.float32(prior_base_prob) + mask_np * (
         np.asarray(persisted_prior, dtype=np.float32) - np.float32(prior_base_prob)
     )
-    require_probability_range(out_np, "temporal_edge_prior.out")
+    if check_invariants:
+        require_probability_range(out_np, "temporal_edge_prior.out")
     return out_np
 
 
@@ -109,10 +113,11 @@ class CorridorSpillbackCPD(nn.Module):
         self.raw_w_lane = nn.Parameter(torch.tensor(math.log(math.exp(1.2) - 1.0), dtype=torch.float32))
         self.raw_w_prev = nn.Parameter(torch.tensor(math.log(math.exp(0.55) - 1.0), dtype=torch.float32))
 
-    def forward(self, x_corridor_raw: Tensor) -> Tensor:
+    def forward(self, x_corridor_raw: Tensor, *, check_invariants: bool = True) -> Tensor:
         """Compute physical spillback logits ``[N_C]`` from unnormalized ``X_C [N_C, 12]``."""
         require_shape(x_corridor_raw, (None, 12), "CorridorSpillbackCPD.x_corridor_raw")
-        require_finite(x_corridor_raw, "CorridorSpillbackCPD.x_corridor_raw")
+        if check_invariants:
+            require_finite(x_corridor_raw, "CorridorSpillbackCPD.x_corridor_raw")
         if x_corridor_raw.shape[0] == 0:
             return x_corridor_raw.new_empty((0,))
 
@@ -142,7 +147,8 @@ class CorridorSpillbackCPD(nn.Module):
             - w_lane * (lane_ratio - 1.0)
             + w_prev * _safe_logit_tensor(prev_q)
         )
-        require_finite(logits, "CorridorSpillbackCPD.logits")
+        if check_invariants:
+            require_finite(logits, "CorridorSpillbackCPD.logits")
         return logits
 
 
@@ -185,20 +191,24 @@ def expected_downstream_spillback(
     veh_turn_out_corridor_idx: Tensor,
     veh_turn_prob: Tensor,
     num_vehicles: int,
+    *,
+    check_invariants: bool = True,
 ) -> Tensor:
     """Compute turn-belief-weighted expected downstream spillback ``[N_t]`` (Boundary Lock A safe).
 
     Vehicles on exit-fringe corridors have zero turn entries in ``veh_turn_src_idx`` and
     therefore evaluate strictly to ``0.0``.
     """
-    require_probability_range(corridor_spillback_prob, "expected_downstream_spillback.corridor_spillback_prob")
+    if check_invariants:
+        require_probability_range(corridor_spillback_prob, "expected_downstream_spillback.corridor_spillback_prob")
     out = corridor_spillback_prob.new_zeros((num_vehicles,))
     if num_vehicles == 0 or veh_turn_src_idx.numel() == 0:
         return out
     weighted = veh_turn_prob.to(dtype=out.dtype) * corridor_spillback_prob.index_select(0, veh_turn_out_corridor_idx)
     out = out.index_add(0, veh_turn_src_idx, weighted)
     out = out.clamp(min=0.0, max=1.0)
-    require_probability_range(out, "expected_downstream_spillback.out")
+    if check_invariants:
+        require_probability_range(out, "expected_downstream_spillback.out")
     return out
 
 
@@ -233,22 +243,25 @@ def generalized_noisy_or_base_survival(
     expected_down_spill: Tensor,
     *,
     eps: float = 1e-6,
+    check_invariants: bool = True,
 ) -> Tensor:
     """Compute parent-free survival probability ``z_{i,0}^t = P(D_i^t = 0 | Pa(i) = empty)``."""
-    for t_val, label in (
-        (leak_prob, "leak_prob"),
-        (self_persist_prob, "self_persist_prob"),
-        (prev_delay_post, "prev_delay_post"),
-        (spill_weight, "spill_weight"),
-        (expected_down_spill, "expected_down_spill"),
-    ):
-        require_probability_range(t_val, f"base_survival.{label}")
+    if check_invariants:
+        for t_val, label in (
+            (leak_prob, "leak_prob"),
+            (self_persist_prob, "self_persist_prob"),
+            (prev_delay_post, "prev_delay_post"),
+            (spill_weight, "spill_weight"),
+            (expected_down_spill, "expected_down_spill"),
+        ):
+            require_probability_range(t_val, f"base_survival.{label}")
 
     s_leak = (1.0 - leak_prob).clamp(min=eps, max=1.0)
     s_persist = (1.0 - self_persist_prob * prev_delay_post).clamp(min=eps, max=1.0)
     s_spill = (1.0 - spill_weight * expected_down_spill).clamp(min=eps, max=1.0)
     z0 = (s_leak * s_persist * s_spill).clamp(min=eps, max=1.0 - eps)
-    require_probability_range(z0, "base_survival.z0")
+    if check_invariants:
+        require_probability_range(z0, "base_survival.z0")
     return z0
 
 
@@ -258,6 +271,7 @@ def parent_survival_factors(
     gamma: Tensor,
     *,
     eps: float = 1e-6,
+    check_invariants: bool = True,
 ) -> tuple[Tensor, Tensor]:
     """Compute Generalized Causal Noisy-OR survival factors ``(phi_0, phi_1)`` for active edges.
 
@@ -266,9 +280,10 @@ def parent_survival_factors(
       so a free-flowing conflicting leader (``D_j^t = 0``) still exerts physical conflict delay pressure!
     - ``phi_1 = P(no inhibition from j | D_j^t = 1) = 1 - omega * (kappa + (1 - kappa) * gamma) <= phi_0``.
     """
-    require_probability_range(omega, "parent_survival_factors.omega")
-    require_probability_range(kappa, "parent_survival_factors.kappa")
-    require_probability_range(gamma, "parent_survival_factors.gamma")
+    if check_invariants:
+        require_probability_range(omega, "parent_survival_factors.omega")
+        require_probability_range(kappa, "parent_survival_factors.kappa")
+        require_probability_range(gamma, "parent_survival_factors.gamma")
 
     q0 = (omega * kappa).clamp(min=0.0, max=1.0 - eps)
     q1 = (omega * (kappa + (1.0 - kappa) * gamma)).clamp(min=0.0, max=1.0 - eps)
@@ -286,6 +301,7 @@ class PrunedDAGStructure:
     active_edge_indices: Tensor     # int64 [E_act] indices into C_t
     src_idx: Tensor                 # int64 [E_act]
     dst_idx: Tensor                 # int64 [E_act]
+    dst_rank: Tensor                # int64 [E_act] slot index in [0 .. K_max-1] within dst_idx
     omega: Tensor                   # float32 [E_act]
     kappa: Tensor                   # float32 [E_act]
     gamma: Tensor                   # float32 [E_act]
@@ -310,6 +326,7 @@ def gate_and_prune_edges(
     min_edge_prob: float = 0.05,
     training: bool = False,
     dag_temperature: float = 0.5,
+    check_invariants: bool = True,
 ) -> PrunedDAGStructure:
     """Apply Boundary-Lock-B precedence DAG gating and deterministic top-``K_max`` parent selection.
 
@@ -323,10 +340,11 @@ def gate_and_prune_edges(
     """
     require_shape(edge_index, (2, None), "gate_and_prune_edges.edge_index")
     require_shape(precedence, (num_vehicles,), "gate_and_prune_edges.precedence")
-    require_finite(precedence, "gate_and_prune_edges.precedence")
-    require_probability_range(omega_raw, "gate_and_prune_edges.omega_raw")
-    require_probability_range(kappa, "gate_and_prune_edges.kappa")
-    require_probability_range(gamma, "gate_and_prune_edges.gamma")
+    if check_invariants:
+        require_finite(precedence, "gate_and_prune_edges.precedence")
+        require_probability_range(omega_raw, "gate_and_prune_edges.omega_raw")
+        require_probability_range(kappa, "gate_and_prune_edges.kappa")
+        require_probability_range(gamma, "gate_and_prune_edges.gamma")
 
     if max_parents_k < 1:
         raise DAGInvariantError(
@@ -352,6 +370,7 @@ def gate_and_prune_edges(
             active_edge_indices=empty_long,
             src_idx=empty_long,
             dst_idx=empty_long,
+            dst_rank=empty_long,
             omega=empty_f,
             kappa=empty_f,
             gamma=empty_f,
@@ -366,7 +385,7 @@ def gate_and_prune_edges(
 
     src_all = edge_index[0]
     dst_all = edge_index[1]
-    if bool((src_all == dst_all).any().item()):
+    if check_invariants and bool((src_all == dst_all).any().item()):
         raise DAGInvariantError("Self-loop detected in candidate edge_index passed to gate_and_prune_edges.")
 
     r_src = precedence.index_select(0, src_all)
@@ -391,6 +410,7 @@ def gate_and_prune_edges(
             active_edge_indices=empty_long,
             src_idx=empty_long,
             dst_idx=empty_long,
+            dst_rank=empty_long,
             omega=empty_f,
             kappa=empty_f,
             gamma=empty_f,
@@ -404,24 +424,32 @@ def gate_and_prune_edges(
         )
 
     # Deterministic per-destination top-K_max selection without Python loops over E_cand:
-    # Sort eligible edges by (dst_idx ASC, -gated_omega ASC, src_idx ASC).
+    # Pack (dst_idx [19b], ieee754_inv_omega [24b], src_idx [19b]) into a single 62-bit int64 key
+    # so ONE radix argsort orders strictly by (dst_idx ASC, -gated_omega ASC, src_idx ASC) with zero
+    # float64 casts and zero precision loss up to 524,287 vehicles (with 3-pass fallback above that).
     dst_el = dst_all.index_select(0, eligible_indices)
     src_el = src_all.index_select(0, eligible_indices)
-    w_el = gated_omega.index_select(0, eligible_indices).detach()
+    w_el = gated_omega.index_select(0, eligible_indices).detach().float()
 
-    # Lexicographic composite key in float64: dst * 4.0 + (1.0 - w_el) + src * 1e-9
-    sort_key = (
-        dst_el.to(torch.float64) * 4.0
-        + (1.0 - w_el.to(torch.float64))
-        + src_el.to(torch.float64) * 1e-9
-    )
-    perm = torch.argsort(sort_key, stable=True)
+    if num_vehicles < (1 << 19):
+        inv_w_bits = (2.0 - w_el.clamp(min=0.0, max=1.0)).contiguous().view(torch.int32).to(torch.int64) - 0x3F800000
+        sort_key_i64 = (dst_el << 43) + (inv_w_bits << 19) + src_el
+        perm = torch.argsort(sort_key_i64, stable=True)
+    else:
+        p1 = torch.argsort(src_el, stable=True)
+        p2 = torch.argsort(-w_el.index_select(0, p1), stable=True)
+        p12 = p1.index_select(0, p2)
+        p3 = torch.argsort(dst_el.index_select(0, p12), stable=True)
+        perm = p12.index_select(0, p3)
+
     sorted_el_idx = eligible_indices.index_select(0, perm)
     sorted_dst = dst_el.index_select(0, perm)
 
-    # Compute within-destination rank [0, 1, ..., deg(i)-1] in O(E_el) vectorized ops
+    # Compute within-destination rank [0, 1, ..., deg(i)-1] in O(E_el) with zero bincount CUDA sync
     n_el = int(sorted_dst.numel())
-    counts = torch.bincount(sorted_dst, minlength=num_vehicles)
+    counts = torch.zeros((num_vehicles,), dtype=torch.long, device=device).index_add(
+        0, sorted_dst, torch.ones_like(sorted_dst)
+    )
     group_starts = torch.cumsum(counts, dim=0) - counts
     within_rank = torch.arange(n_el, dtype=torch.long, device=device) - group_starts.index_select(0, sorted_dst)
 
@@ -434,7 +462,9 @@ def gate_and_prune_edges(
     omega_act = gated_omega.index_select(0, active_edge_indices)
     kappa_act = kappa.index_select(0, active_edge_indices)
     gamma_act = gamma.index_select(0, active_edge_indices)
-    phi_0_act, phi_1_act = parent_survival_factors(omega_act, kappa_act, gamma_act)
+    phi_0_act, phi_1_act = parent_survival_factors(
+        omega_act, kappa_act, gamma_act, check_invariants=check_invariants
+    )
 
     parent_idx_padded = torch.zeros((num_vehicles, max_parents_k), dtype=torch.long, device=device)
     parent_edge_pos_padded = torch.zeros((num_vehicles, max_parents_k), dtype=torch.long, device=device)
@@ -457,6 +487,7 @@ def gate_and_prune_edges(
         active_edge_indices=active_edge_indices,
         src_idx=src_act,
         dst_idx=dst_act,
+        dst_rank=active_ranks,
         omega=omega_act,
         kappa=kappa_act,
         gamma=gamma_act,

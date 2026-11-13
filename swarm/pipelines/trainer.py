@@ -79,6 +79,7 @@ from ..dbn.updater import (
 from ..logging_utils import (
     CheckpointIntegrityError,
     ConfigValidationError,
+    DAGInvariantError,
     NumericalInvariantError,
     get_logger,
     require_finite,
@@ -593,18 +594,24 @@ def _build_step_carries(
 
 @dataclass(frozen=True)
 class PrecomputedDeviceStep:
-    """Pre-staged step inputs, supervised targets, and class-balance weights on compute device."""
+    """Pre-staged step inputs, supervised targets, and per-element loss weights on compute device."""
 
     inputs: PrecomputedStepInputs
-    y_delay: Tensor         # [N_t] float32 on device
-    tau_delay: Tensor       # [N_t] float32 on device
-    w_tau: Tensor           # [N_t] float32 on device
-    y_spill: Tensor         # [N_C] float32 on device
-    y_edge: Tensor          # [E_t] float32 on device
-    alpha_w_edge: Tensor    # [E_t] float32 on device
-    rank_pairs: Tensor      # [M, 2] int64 on device
-    pos_w_d: Tensor         # [] float32 on device
-    pos_w_c: Tensor         # [] float32 on device
+    batch_count: int        # B >= 1 windows/episodes collated into this super-graph step
+    y_delay: Tensor         # [sum N_v] float32 on device
+    pos_w_d_vec: Tensor     # [sum N_v] float32 on device: pos_w_d[b] per node
+    inv_nv_vec: Tensor      # [sum N_v] float32 on device: 1 / N_v[b] per node
+    tau_delay: Tensor       # [sum N_v] float32 on device
+    w_tau_scaled: Tensor    # [sum N_v] float32 on device: w_tau[i] / N_v[b]
+    y_spill: Tensor         # [sum N_c] float32 on device
+    pos_w_c_vec: Tensor     # [sum N_c] float32 on device: pos_w_c[b] per corridor
+    inv_nc_vec: Tensor      # [sum N_c] float32 on device: 1 / N_c[b] per corridor
+    y_edge: Tensor          # [sum E] float32 on device
+    alpha_w_scaled: Tensor  # [sum E] float32 on device: alpha_w_edge[e] / E[b]
+    inv_ne_vec: Tensor      # [sum E] float32 on device: 1 / E[b] per edge
+    rank_pairs: Tensor      # [sum M_valid, 2] int64 on device (valid iff M_b > 0 and N_v[b] >= 2)
+    inv_mrank_vec: Tensor   # [sum M_valid] float32 on device: 1 / M_b per valid rank pair
+    inv_me_vec: Tensor      # [sum M_e] float32 on device: 1 / M_e[b] per persisted edge in edge_curr_idx
 
 
 def _compute_string_alignment_np(
@@ -706,6 +713,7 @@ def prestage_rollout_dataset(
         raise ConfigValidationError("prestage_rollout_dataset requires a fitted FeatureNormalizer.")
 
     empty_long_dev = torch.zeros((0,), dtype=torch.long, device=device)
+    empty_f32_dev = torch.zeros((0,), dtype=torch.float32, device=device)
     prestaged_episodes: list[list[PrecomputedDeviceStep]] = []
 
     for ep in dataset.episodes:
@@ -729,6 +737,10 @@ def prestage_rollout_dataset(
             n_v = cand.num_vehicles
             n_c = len(fb.corridor_ids)
             e_cand = cand.num_edges
+            if e_cand > 0 and bool(np.any(cand.edge_index[0] == cand.edge_index[1])):
+                raise DAGInvariantError(
+                    "Self-loop detected in candidate edge_index during prestage_rollout_dataset."
+                )
 
             if is_contig and prev_fb is not None:
                 veh_same, v_c_np, v_p_np = _compute_string_alignment_np(
@@ -831,45 +843,77 @@ def prestage_rollout_dataset(
             y_s_cpu = lbls["y_spillback"].to(dtype=torch.float32)
             y_e_cpu = lbls["y_edge"].to(dtype=torch.float32)
             rp_cpu = lbls["rank_pairs"].to(dtype=torch.long)
-            if rp_cpu.numel() == 0:
-                rp_cpu = rp_cpu.reshape(0, 2)
+            if rp_cpu.numel() == 0 or n_v < 2:
+                rp_cpu = torch.zeros((0, 2), dtype=torch.long)
 
             if n_v > 0:
                 n_pos_d = float((y_d_cpu > 0.5).sum().item())
                 n_neg_d = float(n_v) - n_pos_d
                 pos_w_d_val = min(8.0, max(1.0, (n_neg_d + 1.0) / (n_pos_d + 1.0)))
-                w_tau_cpu = torch.where(y_d_cpu > 0.5, 1.0, 0.35)
+                inv_nv_val = 1.0 / float(n_v)
+                pos_w_d_vec = torch.full((n_v,), pos_w_d_val, dtype=torch.float32, device=device)
+                inv_nv_vec = torch.full((n_v,), inv_nv_val, dtype=torch.float32, device=device)
+                w_tau_scaled = (torch.where(y_d_cpu > 0.5, 1.0, 0.35) * inv_nv_val).to(
+                    device=device, dtype=torch.float32
+                )
             else:
-                pos_w_d_val = 1.0
-                w_tau_cpu = torch.zeros((0,), dtype=torch.float32)
+                pos_w_d_vec = empty_f32_dev
+                inv_nv_vec = empty_f32_dev
+                w_tau_scaled = empty_f32_dev
 
             if e_cand > 0:
                 e_pos = float((y_e_cpu > 0.5).sum().item())
                 e_neg = float(e_cand) - e_pos
                 pos_w_e_val = min(12.0, max(1.0, (e_neg + 1.0) / (e_pos + 1.0)))
-                alpha_w_cpu = torch.where(y_e_cpu > 0.5, pos_w_e_val, 1.0)
+                inv_ne_val = 1.0 / float(e_cand)
+                alpha_w_scaled = (torch.where(y_e_cpu > 0.5, pos_w_e_val, 1.0) * inv_ne_val).to(
+                    device=device, dtype=torch.float32
+                )
+                inv_ne_vec = torch.full((e_cand,), inv_ne_val, dtype=torch.float32, device=device)
             else:
-                alpha_w_cpu = torch.zeros((0,), dtype=torch.float32)
+                alpha_w_scaled = empty_f32_dev
+                inv_ne_vec = empty_f32_dev
 
             if n_c > 0:
                 c_pos = float((y_s_cpu > 0.5).sum().item())
                 c_neg = float(n_c) - c_pos
                 pos_w_c_val = min(8.0, max(1.0, (c_neg + 1.0) / (c_pos + 1.0)))
+                pos_w_c_vec = torch.full((n_c,), pos_w_c_val, dtype=torch.float32, device=device)
+                inv_nc_vec = torch.full((n_c,), 1.0 / float(n_c), dtype=torch.float32, device=device)
             else:
-                pos_w_c_val = 1.0
+                pos_w_c_vec = empty_f32_dev
+                inv_nc_vec = empty_f32_dev
+
+            m_rank = int(rp_cpu.shape[0])
+            if m_rank > 0:
+                inv_mrank_vec = torch.full((m_rank,), 1.0 / float(m_rank), dtype=torch.float32, device=device)
+            else:
+                inv_mrank_vec = empty_f32_dev
+
+            m_e = int(edge_curr_idx.numel())
+            if m_e > 0:
+                inv_me_vec = torch.full((m_e,), 1.0 / float(m_e), dtype=torch.float32, device=device)
+            else:
+                inv_me_vec = empty_f32_dev
 
             ep_out.append(
                 PrecomputedDeviceStep(
                     inputs=inputs,
+                    batch_count=1,
                     y_delay=y_d_cpu.to(device=device),
+                    pos_w_d_vec=pos_w_d_vec,
+                    inv_nv_vec=inv_nv_vec,
                     tau_delay=tau_cpu.to(device=device),
-                    w_tau=w_tau_cpu.to(device=device, dtype=torch.float32),
+                    w_tau_scaled=w_tau_scaled,
                     y_spill=y_s_cpu.to(device=device),
+                    pos_w_c_vec=pos_w_c_vec,
+                    inv_nc_vec=inv_nc_vec,
                     y_edge=y_e_cpu.to(device=device),
-                    alpha_w_edge=alpha_w_cpu.to(device=device, dtype=torch.float32),
+                    alpha_w_scaled=alpha_w_scaled,
+                    inv_ne_vec=inv_ne_vec,
                     rank_pairs=rp_cpu.to(device=device),
-                    pos_w_d=torch.tensor(pos_w_d_val, dtype=torch.float32, device=device),
-                    pos_w_c=torch.tensor(pos_w_c_val, dtype=torch.float32, device=device),
+                    inv_mrank_vec=inv_mrank_vec,
+                    inv_me_vec=inv_me_vec,
                 )
             )
             prev_fb = fb
@@ -877,6 +921,231 @@ def prestage_rollout_dataset(
         prestaged_episodes.append(ep_out)
 
     return prestaged_episodes
+
+
+def collate_precomputed_window_batch(
+    windows: Sequence[Sequence[PrecomputedDeviceStep]],
+) -> list[PrecomputedDeviceStep]:
+    """Collate ``B`` equal-length trajectories into a Disjoint-Union Super-Graph sequence on device."""
+    if not windows:
+        raise ConfigValidationError("collate_precomputed_window_batch requires at least one window.")
+    n_win = len(windows)
+    if n_win == 1:
+        return list(windows[0])
+
+    seq_len = len(windows[0])
+    if any(len(w) != seq_len for w in windows):
+        raise ConfigValidationError("collate_precomputed_window_batch requires equal-length windows.")
+    if seq_len == 0:
+        return []
+
+    device = windows[0][0].y_delay.device
+    dt = float(windows[0][0].inputs.dt)
+    empty_long_dev = torch.zeros((0,), dtype=torch.long, device=device)
+    empty_f32_dev = torch.zeros((0,), dtype=torch.float32, device=device)
+    empty_2_long_dev = torch.zeros((2, 0), dtype=torch.long, device=device)
+    empty_02_long_dev = torch.zeros((0, 2), dtype=torch.long, device=device)
+
+    prev_v_offs = [0] * n_win
+    prev_c_offs = [0] * n_win
+    prev_e_offs = [0] * n_win
+    synth_sim_t = 0.0
+    collated: list[PrecomputedDeviceStep] = []
+
+    for s in range(seq_len):
+        step_list = [w[s] for w in windows]
+        if s > 0:
+            if all(st.inputs.is_contiguous_from_prev for st in step_list):
+                delta_step = max(
+                    0.0, float(windows[0][s].inputs.sim_time - windows[0][s - 1].inputs.sim_time)
+                )
+                synth_sim_t += delta_step
+            else:
+                synth_sim_t += dt
+
+        curr_v_offs: list[int] = []
+        curr_c_offs: list[int] = []
+        curr_e_offs: list[int] = []
+        v_acc = 0
+        c_acc = 0
+        e_acc = 0
+        for st in step_list:
+            curr_v_offs.append(v_acc)
+            v_acc += st.inputs.num_vehicles
+            curr_c_offs.append(c_acc)
+            c_acc += st.inputs.num_corridors
+            curr_e_offs.append(e_acc)
+            e_acc += st.inputs.num_edges
+
+        is_contig = s > 0 and all(st.inputs.is_contiguous_from_prev for st in step_list)
+        if is_contig:
+            veh_same = all(st.inputs.veh_same for st in step_list)
+            corr_same = all(st.inputs.corr_same for st in step_list)
+            edge_same = all(st.inputs.edge_same for st in step_list)
+
+            if veh_same:
+                ident_v = torch.arange(v_acc, dtype=torch.long, device=device) if v_acc > 0 else empty_long_dev
+                veh_curr_idx = ident_v
+                veh_prev_idx = ident_v
+            else:
+                vc_parts = [
+                    st.inputs.veh_curr_idx + curr_v_offs[b]
+                    for b, st in enumerate(step_list)
+                    if st.inputs.veh_curr_idx.numel() > 0
+                ]
+                vp_parts = [
+                    st.inputs.veh_prev_idx + prev_v_offs[b]
+                    for b, st in enumerate(step_list)
+                    if st.inputs.veh_prev_idx.numel() > 0
+                ]
+                veh_curr_idx = torch.cat(vc_parts, dim=0) if vc_parts else empty_long_dev
+                veh_prev_idx = torch.cat(vp_parts, dim=0) if vp_parts else empty_long_dev
+
+            if corr_same:
+                ident_c = torch.arange(c_acc, dtype=torch.long, device=device) if c_acc > 0 else empty_long_dev
+                corr_curr_idx = ident_c
+                corr_prev_idx = ident_c
+            else:
+                cc_parts = [
+                    st.inputs.corr_curr_idx + curr_c_offs[b]
+                    for b, st in enumerate(step_list)
+                    if st.inputs.corr_curr_idx.numel() > 0
+                ]
+                cp_parts = [
+                    st.inputs.corr_prev_idx + prev_c_offs[b]
+                    for b, st in enumerate(step_list)
+                    if st.inputs.corr_prev_idx.numel() > 0
+                ]
+                corr_curr_idx = torch.cat(cc_parts, dim=0) if cc_parts else empty_long_dev
+                corr_prev_idx = torch.cat(cp_parts, dim=0) if cp_parts else empty_long_dev
+
+            ec_parts = [
+                st.inputs.edge_curr_idx + curr_e_offs[b]
+                for b, st in enumerate(step_list)
+                if st.inputs.edge_curr_idx.numel() > 0
+            ]
+            ep_parts = [
+                st.inputs.edge_prev_idx + prev_e_offs[b]
+                for b, st in enumerate(step_list)
+                if st.inputs.edge_prev_idx.numel() > 0
+            ]
+            inv_me_parts = [st.inv_me_vec for st in step_list if st.inv_me_vec.numel() > 0]
+            edge_curr_idx = torch.cat(ec_parts, dim=0) if ec_parts else empty_long_dev
+            edge_prev_idx = torch.cat(ep_parts, dim=0) if ep_parts else empty_long_dev
+            inv_me_vec = torch.cat(inv_me_parts, dim=0) if inv_me_parts else empty_f32_dev
+        else:
+            veh_same = False
+            corr_same = False
+            edge_same = False
+            veh_curr_idx = empty_long_dev
+            veh_prev_idx = empty_long_dev
+            corr_curr_idx = empty_long_dev
+            corr_prev_idx = empty_long_dev
+            edge_curr_idx = empty_long_dev
+            edge_prev_idx = empty_long_dev
+            inv_me_vec = empty_f32_dev
+
+        e_idx_parts = [
+            st.inputs.edge_index + curr_v_offs[b]
+            for b, st in enumerate(step_list)
+            if st.inputs.num_edges > 0
+        ]
+        ce_idx_parts = [
+            st.inputs.corr_edge_index + curr_c_offs[b]
+            for b, st in enumerate(step_list)
+            if st.inputs.corr_edge_index.shape[1] > 0
+        ]
+        vc_idx_parts = [
+            st.inputs.veh_corridor_idx + curr_c_offs[b]
+            for b, st in enumerate(step_list)
+            if st.inputs.num_vehicles > 0
+        ]
+        tsrc_parts = [
+            st.inputs.veh_turn_src_idx + curr_v_offs[b]
+            for b, st in enumerate(step_list)
+            if st.inputs.veh_turn_src_idx.numel() > 0
+        ]
+        tout_parts = [
+            st.inputs.veh_turn_out_corridor_idx + curr_c_offs[b]
+            for b, st in enumerate(step_list)
+            if st.inputs.veh_turn_out_corridor_idx.numel() > 0
+        ]
+        tprob_parts = [
+            st.inputs.veh_turn_prob for st in step_list if st.inputs.veh_turn_prob.numel() > 0
+        ]
+        rp_parts = [
+            st.rank_pairs + curr_v_offs[b]
+            for b, st in enumerate(step_list)
+            if st.rank_pairs.shape[0] > 0
+        ]
+        inv_mr_parts = [st.inv_mrank_vec for st in step_list if st.inv_mrank_vec.numel() > 0]
+
+        has_raw_e = step_list[0].inputs.x_edge_raw is not None
+        super_inputs = PrecomputedStepInputs(
+            sim_time=synth_sim_t,
+            dt=dt,
+            veh_ids=(),
+            corridor_ids=(),
+            num_vehicles=v_acc,
+            num_corridors=c_acc,
+            num_edges=e_acc,
+            z_veh=torch.cat([st.inputs.z_veh for st in step_list], dim=0),
+            z_corr=torch.cat([st.inputs.z_corr for st in step_list], dim=0),
+            z_edge=torch.cat([st.inputs.z_edge for st in step_list], dim=0),
+            z_cc=torch.cat([st.inputs.z_cc for st in step_list], dim=0),
+            x_corr_raw=torch.cat([st.inputs.x_corr_raw for st in step_list], dim=0),
+            x_edge_raw=(
+                torch.cat([st.inputs.x_edge_raw for st in step_list], dim=0)  # type: ignore[misc]
+                if has_raw_e
+                else None
+            ),
+            edge_index=torch.cat(e_idx_parts, dim=1) if e_idx_parts else empty_2_long_dev,
+            corr_edge_index=torch.cat(ce_idx_parts, dim=1) if ce_idx_parts else empty_2_long_dev,
+            veh_corridor_idx=torch.cat(vc_idx_parts, dim=0) if vc_idx_parts else empty_long_dev,
+            veh_turn_src_idx=torch.cat(tsrc_parts, dim=0) if tsrc_parts else empty_long_dev,
+            veh_turn_out_corridor_idx=torch.cat(tout_parts, dim=0) if tout_parts else empty_long_dev,
+            veh_turn_prob=torch.cat(tprob_parts, dim=0) if tprob_parts else empty_f32_dev,
+            topo_precedence=torch.cat([st.inputs.topo_precedence for st in step_list], dim=0),
+            speed_evidence_pos=torch.cat([st.inputs.speed_evidence_pos for st in step_list], dim=0),
+            base_prev_delay_post=torch.cat([st.inputs.base_prev_delay_post for st in step_list], dim=0),
+            base_prior_edge_prob=torch.cat([st.inputs.base_prior_edge_prob for st in step_list], dim=0),
+            is_contiguous_from_prev=is_contig,
+            veh_same=veh_same,
+            veh_curr_idx=veh_curr_idx,
+            veh_prev_idx=veh_prev_idx,
+            corr_same=corr_same,
+            corr_curr_idx=corr_curr_idx,
+            corr_prev_idx=corr_prev_idx,
+            edge_same=edge_same,
+            edge_curr_idx=edge_curr_idx,
+            edge_prev_idx=edge_prev_idx,
+        )
+
+        collated.append(
+            PrecomputedDeviceStep(
+                inputs=super_inputs,
+                batch_count=sum(st.batch_count for st in step_list),
+                y_delay=torch.cat([st.y_delay for st in step_list], dim=0),
+                pos_w_d_vec=torch.cat([st.pos_w_d_vec for st in step_list], dim=0),
+                inv_nv_vec=torch.cat([st.inv_nv_vec for st in step_list], dim=0),
+                tau_delay=torch.cat([st.tau_delay for st in step_list], dim=0),
+                w_tau_scaled=torch.cat([st.w_tau_scaled for st in step_list], dim=0),
+                y_spill=torch.cat([st.y_spill for st in step_list], dim=0),
+                pos_w_c_vec=torch.cat([st.pos_w_c_vec for st in step_list], dim=0),
+                inv_nc_vec=torch.cat([st.inv_nc_vec for st in step_list], dim=0),
+                y_edge=torch.cat([st.y_edge for st in step_list], dim=0),
+                alpha_w_scaled=torch.cat([st.alpha_w_scaled for st in step_list], dim=0),
+                inv_ne_vec=torch.cat([st.inv_ne_vec for st in step_list], dim=0),
+                rank_pairs=torch.cat(rp_parts, dim=0) if rp_parts else empty_02_long_dev,
+                inv_mrank_vec=torch.cat(inv_mr_parts, dim=0) if inv_mr_parts else empty_f32_dev,
+                inv_me_vec=inv_me_vec,
+            )
+        )
+        prev_v_offs = curr_v_offs
+        prev_c_offs = curr_c_offs
+        prev_e_offs = curr_e_offs
+
+    return collated
 
 
 def compute_precomputed_step_loss(
@@ -887,32 +1156,39 @@ def compute_precomputed_step_loss(
     prev_omega_det_vec: Tensor | None,
     device: torch.device,
 ) -> tuple[Tensor, Tensor]:
-    """Compute the 8-term multi-task causal loss in FP32 with zero Python loops or CPU syncs."""
+    """Compute exact per-window-averaged 8-term multi-task causal loss in FP32 on a (super-)graph step."""
     zero = torch.zeros((), dtype=torch.float32, device=device)
     inp = pstep.inputs
     n_v = inp.num_vehicles
     n_c = inp.num_corridors
     e_cand = inp.num_edges
     m_rank = int(pstep.rank_pairs.shape[0])
+    inv_b = 1.0 / float(max(1, pstep.batch_count))
 
     if n_v > 0:
-        loss_delay_pred = F.binary_cross_entropy_with_logits(
+        bce_d_pred = F.binary_cross_entropy_with_logits(
             step_out.delay_pred_logits_scaled.float(),
             pstep.y_delay,
-            pos_weight=pstep.pos_w_d,
+            pos_weight=pstep.pos_w_d_vec,
+            reduction="none",
         )
-        loss_delay_post = F.binary_cross_entropy_with_logits(
+        loss_delay_pred = torch.sum(pstep.inv_nv_vec * bce_d_pred) * inv_b
+
+        bce_d_post = F.binary_cross_entropy_with_logits(
             step_out.delay_post_logits_scaled.float(),
             pstep.y_delay,
-            pos_weight=pstep.pos_w_d,
+            pos_weight=pstep.pos_w_d_vec,
+            reduction="none",
         )
+        loss_delay_post = torch.sum(pstep.inv_nv_vec * bce_d_post) * inv_b
+
         huber_vec = F.huber_loss(
             step_out.expected_delay_s.float(),
             pstep.tau_delay,
             reduction="none",
             delta=2.0,
         )
-        loss_tau = torch.mean(pstep.w_tau * huber_vec)
+        loss_tau = torch.sum(pstep.w_tau_scaled * huber_vec) * inv_b
     else:
         loss_delay_pred = zero
         loss_delay_post = zero
@@ -924,26 +1200,28 @@ def compute_precomputed_step_loss(
         probs_e = torch.sigmoid(logits_e)
         p_t = pstep.y_edge * probs_e + (1.0 - pstep.y_edge) * (1.0 - probs_e)
         focal_mod = (1.0 - p_t).clamp(min=0.0).pow(float(train_cfg.focal_gamma))
-        loss_edge = torch.mean(pstep.alpha_w_edge * focal_mod * bce_raw)
-        loss_l1 = torch.mean(step_out.omega_raw.float())
+        loss_edge = torch.sum(pstep.alpha_w_scaled * focal_mod * bce_raw) * inv_b
+        loss_l1 = torch.sum(pstep.inv_ne_vec * step_out.omega_raw.float()) * inv_b
     else:
         loss_edge = zero
         loss_l1 = zero
 
-    if m_rank > 0 and n_v >= 2:
+    if m_rank > 0:
         prec = step_out.transformer_out.precedence.float()
         r_j = prec.index_select(0, pstep.rank_pairs[:, 0])
         r_i = prec.index_select(0, pstep.rank_pairs[:, 1])
-        loss_rank = torch.mean(F.relu(1.0 - (r_j - r_i)))
+        loss_rank = torch.sum(pstep.inv_mrank_vec * F.relu(1.0 - (r_j - r_i))) * inv_b
     else:
         loss_rank = zero
 
     if n_c > 0:
-        loss_spill = F.binary_cross_entropy_with_logits(
+        bce_s = F.binary_cross_entropy_with_logits(
             step_out.corridor_spillback_logits_scaled.float(),
             pstep.y_spill,
-            pos_weight=pstep.pos_w_c,
+            pos_weight=pstep.pos_w_c_vec,
+            reduction="none",
         )
+        loss_spill = torch.sum(pstep.inv_nc_vec * bce_s) * inv_b
     else:
         loss_spill = zero
 
@@ -953,7 +1231,7 @@ def compute_precomputed_step_loss(
             diff = om_f32 - prev_omega_det_vec
         else:
             diff = om_f32.index_select(0, inp.edge_curr_idx) - prev_omega_det_vec.index_select(0, inp.edge_prev_idx)
-        loss_smooth = torch.mean(diff * diff)
+        loss_smooth = torch.sum(pstep.inv_me_vec * (diff * diff)) * inv_b
     else:
         loss_smooth = zero
 
@@ -1003,6 +1281,20 @@ def _parts_vec_to_dict(parts_vec: Tensor) -> dict[str, float]:
     return {k: float(v) for k, v in zip(_LOSS_COMPONENT_KEYS, vals, strict=True)}
 
 
+def _sequence_group_key(seq: Sequence[PrecomputedDeviceStep]) -> tuple[Any, ...]:
+    """Return grouping key ensuring identical length, dt, contiguity pattern, and step deltas."""
+    if not seq:
+        return (0,)
+    dt_r = round(float(seq[0].inputs.dt), 6)
+    pattern = tuple(
+        round(float(seq[s].inputs.sim_time - seq[s - 1].inputs.sim_time), 5)
+        if seq[s].inputs.is_contiguous_from_prev
+        else -1.0
+        for s in range(1, len(seq))
+    )
+    return (len(seq), dt_r, pattern)
+
+
 def _evaluate_validation_episodes(
     *,
     raw_model: STGraphTransformerDBN,
@@ -1014,6 +1306,7 @@ def _evaluate_validation_episodes(
     temperatures: TemperatureScales | None = None,
     collect_logits: bool = False,
     prestaged_episodes: Sequence[Sequence[PrecomputedDeviceStep]] | None = None,
+    eval_batch_size: int = 16,
 ) -> tuple[dict[str, float], dict[str, np.ndarray]]:
     """Run full-episode sequential evaluation strictly in ``model.eval()`` hard-DAG mode (Boundary Lock B)."""
     raw_model.eval()
@@ -1037,56 +1330,70 @@ def _evaluate_validation_episodes(
     link_logits_all: list[Tensor] = []
     link_targets_all: list[Tensor] = []
 
+    ep_groups: dict[tuple[Any, ...], list[Sequence[PrecomputedDeviceStep]]] = {}
+    for ep_steps in episodes_dev:
+        if not ep_steps:
+            continue
+        ep_groups.setdefault(_sequence_group_key(ep_steps), []).append(ep_steps)
+
+    bs_eval = max(1, int(eval_batch_size))
     with torch.no_grad():
-        for ep_steps in episodes_dev:
-            prev_mem: TorchTemporalMemory | None = None
-            prev_delay_vec: Tensor | None = None
-            prev_omega_vec: Tensor | None = None
-            prev_omega_det_vec: Tensor | None = None
+        for grp_list in ep_groups.values():
+            for g_start in range(0, len(grp_list), bs_eval):
+                chunk = grp_list[g_start : g_start + bs_eval]
+                n_chunk = len(chunk)
+                super_ep = collate_precomputed_window_batch(chunk)
 
-            for pstep in ep_steps:
-                if not pstep.inputs.is_contiguous_from_prev:
-                    prev_mem = None
-                    prev_delay_vec = None
-                    prev_omega_vec = None
-                    prev_omega_det_vec = None
+                prev_mem: TorchTemporalMemory | None = None
+                prev_delay_vec: Tensor | None = None
+                prev_omega_vec: Tensor | None = None
+                prev_omega_det_vec: Tensor | None = None
 
-                step_out = forward_dbn_precomputed_step(
-                    model=raw_model,
-                    step=pstep.inputs,
-                    dbn_cfg=dbn_cfg,
-                    temperatures=temps,
-                    prev_memory=prev_mem,
-                    prev_delay_vec=prev_delay_vec,
-                    prev_omega_vec=prev_omega_vec,
-                )
-                _, parts_vec = compute_precomputed_step_loss(
-                    step_out=step_out,
-                    pstep=pstep,
-                    train_cfg=train_cfg,
-                    prev_omega_det_vec=prev_omega_det_vec,
-                    device=device,
-                )
-                loss_sums_vec = loss_sums_vec + parts_vec
-                total_steps += 1
+                for pstep in super_ep:
+                    if not pstep.inputs.is_contiguous_from_prev:
+                        prev_mem = None
+                        prev_delay_vec = None
+                        prev_omega_vec = None
+                        prev_omega_det_vec = None
 
-                if collect_logits:
-                    if pstep.inputs.num_edges > 0:
-                        edge_logits_all.append(step_out.transformer_out.edge_logits.detach().float().reshape(-1))
-                        edge_targets_all.append(pstep.y_edge.detach().float().reshape(-1))
-                    if pstep.inputs.num_vehicles > 0:
-                        delay_logits_all.append(step_out.lbp_result.delay_pred_logits.detach().float().reshape(-1))
-                        delay_post_logits_all.append(step_out.lbp_result.delay_post_logits.detach().float().reshape(-1))
-                        delay_targets_all.append(pstep.y_delay.detach().float().reshape(-1))
-                    if pstep.inputs.num_corridors > 0:
-                        link_logits_all.append(
-                            step_out.transformer_out.corridor_spillback_logits.detach().float().reshape(-1)
-                        )
-                        link_targets_all.append(pstep.y_spill.detach().float().reshape(-1))
+                    step_out = forward_dbn_precomputed_step(
+                        model=raw_model,
+                        step=pstep.inputs,
+                        dbn_cfg=dbn_cfg,
+                        temperatures=temps,
+                        prev_memory=prev_mem,
+                        prev_delay_vec=prev_delay_vec,
+                        prev_omega_vec=prev_omega_vec,
+                    )
+                    _, parts_vec = compute_precomputed_step_loss(
+                        step_out=step_out,
+                        pstep=pstep,
+                        train_cfg=train_cfg,
+                        prev_omega_det_vec=prev_omega_det_vec,
+                        device=device,
+                    )
+                    loss_sums_vec = loss_sums_vec + parts_vec * float(n_chunk)
+                    total_steps += n_chunk
 
-                prev_mem, prev_delay_vec, prev_omega_vec, prev_omega_det_vec = _build_vector_carries(
-                    step_out, detach=True
-                )
+                    if collect_logits:
+                        if pstep.inputs.num_edges > 0:
+                            edge_logits_all.append(step_out.transformer_out.edge_logits.detach().float().reshape(-1))
+                            edge_targets_all.append(pstep.y_edge.detach().float().reshape(-1))
+                        if pstep.inputs.num_vehicles > 0:
+                            delay_logits_all.append(step_out.lbp_result.delay_pred_logits.detach().float().reshape(-1))
+                            delay_post_logits_all.append(
+                                step_out.lbp_result.delay_post_logits.detach().float().reshape(-1)
+                            )
+                            delay_targets_all.append(pstep.y_delay.detach().float().reshape(-1))
+                        if pstep.inputs.num_corridors > 0:
+                            link_logits_all.append(
+                                step_out.transformer_out.corridor_spillback_logits.detach().float().reshape(-1)
+                            )
+                            link_targets_all.append(pstep.y_spill.detach().float().reshape(-1))
+
+                    prev_mem, prev_delay_vec, prev_omega_vec, prev_omega_det_vec = _build_vector_carries(
+                        step_out, detach=True
+                    )
 
     require_finite(loss_sums_vec, "val.loss_sums_vec")
     denom = float(max(1, total_steps))
@@ -1394,14 +1701,24 @@ def train_neural_dbn(
                 pg["lr"] = lr_now
 
             optimizer.zero_grad(set_to_none=True)
-            batch_scale = 1.0 / float(len(batch_win_indices))
+            b_total = float(len(batch_win_indices))
 
+            win_groups: dict[tuple[Any, ...], list[list[PrecomputedDeviceStep]]] = {}
             for win_idx in batch_win_indices:
                 ep_idx, start_i, end_i = train_dataset.windows[win_idx]
-                window = train_prestaged[ep_idx][start_i:end_i]
-                w_len = len(window)
-                eff_burn = 0 if w_len <= preset_spec.t_burn else min(preset_spec.t_burn, w_len - 1)
+                win_slice = train_prestaged[ep_idx][start_i:end_i]
+                w_len_i = len(win_slice)
+                eff_burn_i = 0 if w_len_i <= preset_spec.t_burn else min(preset_spec.t_burn, w_len_i - 1)
+                g_key = (eff_burn_i, *_sequence_group_key(win_slice))
+                win_groups.setdefault(g_key, []).append(win_slice)
+
+            for g_key, grp_windows in win_groups.items():
+                eff_burn = int(g_key[0])
+                super_win = collate_precomputed_window_batch(grp_windows)
+                w_len = len(super_win)
                 n_sup = max(1, w_len - eff_burn)
+                b_grp = float(len(grp_windows))
+                grp_weight = b_grp / b_total
 
                 prev_mem: TorchTemporalMemory | None = None
                 prev_delay_vec: Tensor | None = None
@@ -1416,7 +1733,7 @@ def train_neural_dbn(
                         enabled=use_bf16,
                     ):
                         for s_i in range(eff_burn):
-                            pstep_burn = window[s_i]
+                            pstep_burn = super_win[s_i]
                             out_burn = forward_dbn_precomputed_step(
                                 model=forward_model,
                                 step=pstep_burn.inputs,
@@ -1431,11 +1748,11 @@ def train_neural_dbn(
                                 out_burn, detach=True
                             )
 
-                # Supervised unrolled BPTT steps
-                win_loss_accum = torch.zeros((), dtype=torch.float32, device=device)
-                win_parts_accum = torch.zeros((len(_LOSS_COMPONENT_KEYS),), dtype=torch.float32, device=device)
+                # Supervised unrolled BPTT steps across the Disjoint-Union Super-Graph
+                grp_loss_accum = torch.zeros((), dtype=torch.float32, device=device)
+                grp_parts_accum = torch.zeros((len(_LOSS_COMPONENT_KEYS),), dtype=torch.float32, device=device)
                 for s_i in range(eff_burn, w_len):
-                    pstep_sup = window[s_i]
+                    pstep_sup = super_win[s_i]
                     with torch.autocast(
                         device_type=autocast_device_type,
                         dtype=torch.bfloat16,
@@ -1458,18 +1775,18 @@ def train_neural_dbn(
                         prev_omega_det_vec=prev_omega_det_vec,
                         device=device,
                     )
-                    win_loss_accum = win_loss_accum + step_loss
-                    win_parts_accum = win_parts_accum + step_parts_vec
+                    grp_loss_accum = grp_loss_accum + step_loss
+                    grp_parts_accum = grp_parts_accum + step_parts_vec
                     prev_mem, prev_delay_vec, prev_omega_vec, prev_omega_det_vec = _build_vector_carries(
                         out_sup, detach=False
                     )
 
-                mean_win_loss = win_loss_accum / float(n_sup)
-                require_finite(mean_win_loss, "train.mean_win_loss")
-                (mean_win_loss * batch_scale).backward()
+                mean_grp_loss = grp_loss_accum / float(n_sup)
+                require_finite(mean_grp_loss, "train.mean_grp_loss")
+                (mean_grp_loss * grp_weight).backward()
 
-                epoch_train_losses_vec = epoch_train_losses_vec + (win_parts_accum / float(n_sup))
-                epoch_sup_windows += 1
+                epoch_train_losses_vec = epoch_train_losses_vec + (grp_parts_accum / float(n_sup)) * b_grp
+                epoch_sup_windows += len(grp_windows)
 
             grad_norm_t = torch.nn.utils.clip_grad_norm_(
                 optim_target_params,
@@ -1824,6 +2141,7 @@ def evaluate_heldout_predictive(
 __all__ = [
     "PrecomputedDeviceStep",
     "RolloutSequenceDataset",
+    "collate_precomputed_window_batch",
     "compute_precomputed_step_loss",
     "compute_step_multitask_loss",
     "evaluate_heldout_predictive",
