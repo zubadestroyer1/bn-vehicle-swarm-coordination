@@ -9,3 +9,9 @@ outputs/
 models/
 build/
 dist/
+error_report_*.json
+*.tmp
+!configs/networks/*
+!configs/scenarios/*
+!scripts/*
+!examples/validation/*
