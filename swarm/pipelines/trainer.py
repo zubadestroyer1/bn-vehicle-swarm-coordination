@@ -26,11 +26,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 import copy
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 import json
+import logging
 import math
 import os
 from pathlib import Path
+import sys
 import time
 from typing import Any
 
@@ -68,6 +70,8 @@ from ..dbn.features import FeatureNormalizer, GraphFeatureBatch
 from ..dbn.transformer import STGraphTransformerDBN, TorchTemporalMemory, TransformerStepOutputs
 from ..dbn.updater import (
     DifferentiableStepOutput,
+    PrecomputedStepInputs,
+    forward_dbn_precomputed_step,
     forward_dbn_step,
     load_dbn_checkpoint,
     save_dbn_checkpoint,
@@ -84,6 +88,28 @@ from ..logging_utils import (
 from .rollout_collector import RolloutSplit, load_rollout_shards
 
 _LOG = get_logger("pipelines.trainer")
+
+_LOSS_COMPONENT_KEYS: tuple[str, ...] = (
+    "total",
+    "delay_pred",
+    "delay_post",
+    "edge_focal",
+    "rank",
+    "tau_huber",
+    "spillback",
+    "smooth",
+    "l1",
+)
+
+
+def _flush_log_streams() -> None:
+    """Flush all configured logger handlers and standard streams for live unbuffered progress."""
+    for logger_name in ("swarm", ""):
+        lg = logging.getLogger(logger_name)
+        for handler in lg.handlers:
+            handler.flush()
+    sys.stdout.flush()
+    sys.stderr.flush()
 
 
 def _to_numpy_f32(val: Any, name: str) -> np.ndarray:
@@ -565,6 +591,418 @@ def _build_step_carries(
     return next_mem, delay_map, edge_map, edge_det_map
 
 
+@dataclass(frozen=True)
+class PrecomputedDeviceStep:
+    """Pre-staged step inputs, supervised targets, and class-balance weights on compute device."""
+
+    inputs: PrecomputedStepInputs
+    y_delay: Tensor         # [N_t] float32 on device
+    tau_delay: Tensor       # [N_t] float32 on device
+    w_tau: Tensor           # [N_t] float32 on device
+    y_spill: Tensor         # [N_C] float32 on device
+    y_edge: Tensor          # [E_t] float32 on device
+    alpha_w_edge: Tensor    # [E_t] float32 on device
+    rank_pairs: Tensor      # [M, 2] int64 on device
+    pos_w_d: Tensor         # [] float32 on device
+    pos_w_c: Tensor         # [] float32 on device
+
+
+def _compute_string_alignment_np(
+    curr_keys: tuple[str, ...],
+    prev_keys: tuple[str, ...],
+) -> tuple[bool, np.ndarray, np.ndarray]:
+    """Compute exact last-wins entity index alignment ``prev_keys -> curr_keys`` on CPU."""
+    n_curr = len(curr_keys)
+    n_prev = len(prev_keys)
+    empty = np.zeros((0,), dtype=np.int64)
+    if n_curr == 0 or n_prev == 0:
+        return (n_curr == 0 and n_prev == 0), empty, empty
+    if curr_keys == prev_keys and len(set(curr_keys)) == n_curr:
+        ident = np.arange(n_curr, dtype=np.int64)
+        return True, ident, ident
+    prev_lookup = {k: i for i, k in enumerate(prev_keys)}
+    c_list: list[int] = []
+    p_list: list[int] = []
+    for ci, k in enumerate(curr_keys):
+        pi = prev_lookup.get(k)
+        if pi is not None:
+            c_list.append(ci)
+            p_list.append(pi)
+    if not c_list:
+        return False, empty, empty
+    c_arr = np.asarray(c_list, dtype=np.int64)
+    p_arr = np.asarray(p_list, dtype=np.int64)
+    return False, c_arr, p_arr
+
+
+def _compute_edge_alignment_np(
+    curr_veh_ids: tuple[str, ...],
+    curr_edge_index: np.ndarray,
+    prev_veh_ids: tuple[str, ...],
+    prev_edge_index: np.ndarray,
+) -> tuple[bool, np.ndarray, np.ndarray]:
+    """Compute O(E log E) last-wins candidate-pair alignment ``(src_id, dst_id)`` via integer codes."""
+    e_curr = int(curr_edge_index.shape[1])
+    e_prev = int(prev_edge_index.shape[1])
+    empty = np.zeros((0,), dtype=np.int64)
+    if e_curr == 0 or e_prev == 0:
+        return (e_curr == 0 and e_prev == 0), empty, empty
+
+    n_prev = len(prev_veh_ids)
+    n_curr = len(curr_veh_ids)
+    if n_prev == 0 or n_curr == 0:
+        return False, empty, empty
+
+    prev_vid_to_uid: dict[str, int] = {}
+    prev_pos_to_uid = np.empty((n_prev,), dtype=np.int64)
+    for idx, vid in enumerate(prev_veh_ids):
+        uid = prev_vid_to_uid.setdefault(vid, len(prev_vid_to_uid))
+        prev_pos_to_uid[idx] = uid
+    n_uid = len(prev_vid_to_uid)
+
+    su_p = prev_pos_to_uid[prev_edge_index[0]]
+    du_p = prev_pos_to_uid[prev_edge_index[1]]
+    prev_code = su_p * n_uid + du_p
+    order_p = np.argsort(prev_code, kind="stable")
+    prev_sorted = prev_code[order_p]
+
+    curr_pos_to_uid = np.fromiter(
+        (prev_vid_to_uid.get(vid, -1) for vid in curr_veh_ids),
+        dtype=np.int64,
+        count=n_curr,
+    )
+    su_c = curr_pos_to_uid[curr_edge_index[0]]
+    du_c = curr_pos_to_uid[curr_edge_index[1]]
+    cand_c = np.flatnonzero((su_c >= 0) & (du_c >= 0))
+    if cand_c.size == 0:
+        return False, empty, empty
+
+    curr_code = su_c[cand_c] * n_uid + du_c[cand_c]
+    ins_right = np.searchsorted(prev_sorted, curr_code, side="right")
+    pos = np.maximum(0, ins_right - 1)
+    hit = (ins_right > 0) & (prev_sorted[pos] == curr_code)
+    if not np.any(hit):
+        return False, empty, empty
+
+    edge_curr_idx = cand_c[hit].astype(np.int64)
+    edge_prev_idx = order_p[pos[hit]].astype(np.int64)
+    edge_same = (
+        e_curr == e_prev
+        and edge_curr_idx.size == e_curr
+        and bool(np.array_equal(edge_prev_idx, np.arange(e_curr, dtype=np.int64)))
+    )
+    return edge_same, edge_curr_idx, edge_prev_idx
+
+
+def prestage_rollout_dataset(
+    dataset: RolloutSequenceDataset,
+    normalizer: FeatureNormalizer,
+    device: torch.device,
+    *,
+    include_raw_edge: bool = False,
+) -> list[list[PrecomputedDeviceStep]]:
+    """Pre-normalize, compute static step-to-step index alignments, and stage all tensors on ``device``."""
+    if not normalizer.fitted:
+        raise ConfigValidationError("prestage_rollout_dataset requires a fitted FeatureNormalizer.")
+
+    empty_long_dev = torch.zeros((0,), dtype=torch.long, device=device)
+    prestaged_episodes: list[list[PrecomputedDeviceStep]] = []
+
+    for ep in dataset.episodes:
+        ep_out: list[PrecomputedDeviceStep] = []
+        prev_fb: GraphFeatureBatch | None = None
+
+        for step_idx, (fb, lbls) in enumerate(ep):
+            is_contig = (
+                step_idx > 0
+                and prev_fb is not None
+                and (fb.sim_time - prev_fb.sim_time) <= (1.5 * max(fb.dt, 0.05) + 1e-6)
+            )
+            z_v_np, z_c_np, z_e_np, z_cc_np = normalizer.transform_arrays(
+                fb.x_veh,
+                fb.x_corridor,
+                fb.x_edge,
+                fb.x_corridor_edge,
+            )
+
+            cand = fb.candidate_graph
+            n_v = cand.num_vehicles
+            n_c = len(fb.corridor_ids)
+            e_cand = cand.num_edges
+
+            if is_contig and prev_fb is not None:
+                veh_same, v_c_np, v_p_np = _compute_string_alignment_np(
+                    cand.veh_ids, prev_fb.candidate_graph.veh_ids
+                )
+                corr_same, c_c_np, c_p_np = _compute_string_alignment_np(
+                    fb.corridor_ids, prev_fb.corridor_ids
+                )
+                edge_same, e_c_np, e_p_np = _compute_edge_alignment_np(
+                    cand.veh_ids,
+                    cand.edge_index,
+                    prev_fb.candidate_graph.veh_ids,
+                    prev_fb.candidate_graph.edge_index,
+                )
+                veh_curr_idx = (
+                    torch.as_tensor(v_c_np, dtype=torch.long, device=device)
+                    if v_c_np.size > 0
+                    else empty_long_dev
+                )
+                veh_prev_idx = (
+                    torch.as_tensor(v_p_np, dtype=torch.long, device=device)
+                    if v_p_np.size > 0
+                    else empty_long_dev
+                )
+                corr_curr_idx = (
+                    torch.as_tensor(c_c_np, dtype=torch.long, device=device)
+                    if c_c_np.size > 0
+                    else empty_long_dev
+                )
+                corr_prev_idx = (
+                    torch.as_tensor(c_p_np, dtype=torch.long, device=device)
+                    if c_p_np.size > 0
+                    else empty_long_dev
+                )
+                edge_curr_idx = (
+                    torch.as_tensor(e_c_np, dtype=torch.long, device=device)
+                    if e_c_np.size > 0
+                    else empty_long_dev
+                )
+                edge_prev_idx = (
+                    torch.as_tensor(e_p_np, dtype=torch.long, device=device)
+                    if e_p_np.size > 0
+                    else empty_long_dev
+                )
+            else:
+                veh_same = False
+                corr_same = False
+                edge_same = False
+                veh_curr_idx = empty_long_dev
+                veh_prev_idx = empty_long_dev
+                corr_curr_idx = empty_long_dev
+                corr_prev_idx = empty_long_dev
+                edge_curr_idx = empty_long_dev
+                edge_prev_idx = empty_long_dev
+
+            inputs = PrecomputedStepInputs(
+                sim_time=fb.sim_time,
+                dt=fb.dt,
+                veh_ids=cand.veh_ids,
+                corridor_ids=fb.corridor_ids,
+                num_vehicles=n_v,
+                num_corridors=n_c,
+                num_edges=e_cand,
+                z_veh=torch.as_tensor(z_v_np, dtype=torch.float32, device=device),
+                z_corr=torch.as_tensor(z_c_np, dtype=torch.float32, device=device),
+                z_edge=torch.as_tensor(z_e_np, dtype=torch.float32, device=device),
+                z_cc=torch.as_tensor(z_cc_np, dtype=torch.float32, device=device),
+                x_corr_raw=torch.as_tensor(fb.x_corridor, dtype=torch.float32, device=device),
+                x_edge_raw=(
+                    torch.as_tensor(fb.x_edge, dtype=torch.float32, device=device)
+                    if include_raw_edge
+                    else None
+                ),
+                edge_index=torch.as_tensor(cand.edge_index, dtype=torch.long, device=device),
+                corr_edge_index=torch.as_tensor(fb.corridor_edge_index, dtype=torch.long, device=device),
+                veh_corridor_idx=torch.as_tensor(fb.veh_corridor_idx, dtype=torch.long, device=device),
+                veh_turn_src_idx=torch.as_tensor(fb.veh_turn_src_idx, dtype=torch.long, device=device),
+                veh_turn_out_corridor_idx=torch.as_tensor(
+                    fb.veh_turn_out_corridor_idx, dtype=torch.long, device=device
+                ),
+                veh_turn_prob=torch.as_tensor(fb.veh_turn_prob, dtype=torch.float32, device=device),
+                topo_precedence=torch.as_tensor(fb.topo_precedence, dtype=torch.float32, device=device),
+                speed_evidence_pos=torch.as_tensor(fb.speed_evidence_pos, dtype=torch.float32, device=device),
+                base_prev_delay_post=torch.as_tensor(fb.prev_delay_post, dtype=torch.float32, device=device),
+                base_prior_edge_prob=torch.as_tensor(fb.prior_edge_prob, dtype=torch.float32, device=device),
+                is_contiguous_from_prev=is_contig,
+                veh_same=veh_same,
+                veh_curr_idx=veh_curr_idx,
+                veh_prev_idx=veh_prev_idx,
+                corr_same=corr_same,
+                corr_curr_idx=corr_curr_idx,
+                corr_prev_idx=corr_prev_idx,
+                edge_same=edge_same,
+                edge_curr_idx=edge_curr_idx,
+                edge_prev_idx=edge_prev_idx,
+            )
+
+            y_d_cpu = lbls["y_delay"].to(dtype=torch.float32)
+            tau_cpu = lbls["tau_delay_s"].to(dtype=torch.float32)
+            y_s_cpu = lbls["y_spillback"].to(dtype=torch.float32)
+            y_e_cpu = lbls["y_edge"].to(dtype=torch.float32)
+            rp_cpu = lbls["rank_pairs"].to(dtype=torch.long)
+            if rp_cpu.numel() == 0:
+                rp_cpu = rp_cpu.reshape(0, 2)
+
+            if n_v > 0:
+                n_pos_d = float((y_d_cpu > 0.5).sum().item())
+                n_neg_d = float(n_v) - n_pos_d
+                pos_w_d_val = min(8.0, max(1.0, (n_neg_d + 1.0) / (n_pos_d + 1.0)))
+                w_tau_cpu = torch.where(y_d_cpu > 0.5, 1.0, 0.35)
+            else:
+                pos_w_d_val = 1.0
+                w_tau_cpu = torch.zeros((0,), dtype=torch.float32)
+
+            if e_cand > 0:
+                e_pos = float((y_e_cpu > 0.5).sum().item())
+                e_neg = float(e_cand) - e_pos
+                pos_w_e_val = min(12.0, max(1.0, (e_neg + 1.0) / (e_pos + 1.0)))
+                alpha_w_cpu = torch.where(y_e_cpu > 0.5, pos_w_e_val, 1.0)
+            else:
+                alpha_w_cpu = torch.zeros((0,), dtype=torch.float32)
+
+            if n_c > 0:
+                c_pos = float((y_s_cpu > 0.5).sum().item())
+                c_neg = float(n_c) - c_pos
+                pos_w_c_val = min(8.0, max(1.0, (c_neg + 1.0) / (c_pos + 1.0)))
+            else:
+                pos_w_c_val = 1.0
+
+            ep_out.append(
+                PrecomputedDeviceStep(
+                    inputs=inputs,
+                    y_delay=y_d_cpu.to(device=device),
+                    tau_delay=tau_cpu.to(device=device),
+                    w_tau=w_tau_cpu.to(device=device, dtype=torch.float32),
+                    y_spill=y_s_cpu.to(device=device),
+                    y_edge=y_e_cpu.to(device=device),
+                    alpha_w_edge=alpha_w_cpu.to(device=device, dtype=torch.float32),
+                    rank_pairs=rp_cpu.to(device=device),
+                    pos_w_d=torch.tensor(pos_w_d_val, dtype=torch.float32, device=device),
+                    pos_w_c=torch.tensor(pos_w_c_val, dtype=torch.float32, device=device),
+                )
+            )
+            prev_fb = fb
+
+        prestaged_episodes.append(ep_out)
+
+    return prestaged_episodes
+
+
+def compute_precomputed_step_loss(
+    *,
+    step_out: DifferentiableStepOutput,
+    pstep: PrecomputedDeviceStep,
+    train_cfg: TrainConfig,
+    prev_omega_det_vec: Tensor | None,
+    device: torch.device,
+) -> tuple[Tensor, Tensor]:
+    """Compute the 8-term multi-task causal loss in FP32 with zero Python loops or CPU syncs."""
+    zero = torch.zeros((), dtype=torch.float32, device=device)
+    inp = pstep.inputs
+    n_v = inp.num_vehicles
+    n_c = inp.num_corridors
+    e_cand = inp.num_edges
+    m_rank = int(pstep.rank_pairs.shape[0])
+
+    if n_v > 0:
+        loss_delay_pred = F.binary_cross_entropy_with_logits(
+            step_out.delay_pred_logits_scaled.float(),
+            pstep.y_delay,
+            pos_weight=pstep.pos_w_d,
+        )
+        loss_delay_post = F.binary_cross_entropy_with_logits(
+            step_out.delay_post_logits_scaled.float(),
+            pstep.y_delay,
+            pos_weight=pstep.pos_w_d,
+        )
+        huber_vec = F.huber_loss(
+            step_out.expected_delay_s.float(),
+            pstep.tau_delay,
+            reduction="none",
+            delta=2.0,
+        )
+        loss_tau = torch.mean(pstep.w_tau * huber_vec)
+    else:
+        loss_delay_pred = zero
+        loss_delay_post = zero
+        loss_tau = zero
+
+    if e_cand > 0:
+        logits_e = step_out.edge_logits_scaled.float()
+        bce_raw = F.binary_cross_entropy_with_logits(logits_e, pstep.y_edge, reduction="none")
+        probs_e = torch.sigmoid(logits_e)
+        p_t = pstep.y_edge * probs_e + (1.0 - pstep.y_edge) * (1.0 - probs_e)
+        focal_mod = (1.0 - p_t).clamp(min=0.0).pow(float(train_cfg.focal_gamma))
+        loss_edge = torch.mean(pstep.alpha_w_edge * focal_mod * bce_raw)
+        loss_l1 = torch.mean(step_out.omega_raw.float())
+    else:
+        loss_edge = zero
+        loss_l1 = zero
+
+    if m_rank > 0 and n_v >= 2:
+        prec = step_out.transformer_out.precedence.float()
+        r_j = prec.index_select(0, pstep.rank_pairs[:, 0])
+        r_i = prec.index_select(0, pstep.rank_pairs[:, 1])
+        loss_rank = torch.mean(F.relu(1.0 - (r_j - r_i)))
+    else:
+        loss_rank = zero
+
+    if n_c > 0:
+        loss_spill = F.binary_cross_entropy_with_logits(
+            step_out.corridor_spillback_logits_scaled.float(),
+            pstep.y_spill,
+            pos_weight=pstep.pos_w_c,
+        )
+    else:
+        loss_spill = zero
+
+    if e_cand > 0 and prev_omega_det_vec is not None and inp.edge_curr_idx.numel() > 0:
+        om_f32 = step_out.omega_raw.float()
+        if inp.edge_same and prev_omega_det_vec.shape[0] == e_cand:
+            diff = om_f32 - prev_omega_det_vec
+        else:
+            diff = om_f32.index_select(0, inp.edge_curr_idx) - prev_omega_det_vec.index_select(0, inp.edge_prev_idx)
+        loss_smooth = torch.mean(diff * diff)
+    else:
+        loss_smooth = zero
+
+    total_loss = (
+        loss_delay_pred
+        + float(train_cfg.loss_w_post_delay) * loss_delay_post
+        + float(train_cfg.loss_w_edge) * loss_edge
+        + float(train_cfg.loss_w_rank) * loss_rank
+        + float(train_cfg.loss_w_tau) * loss_tau
+        + float(train_cfg.loss_w_spillback) * loss_spill
+        + float(train_cfg.loss_w_smooth) * loss_smooth
+        + float(train_cfg.loss_w_l1) * loss_l1
+    )
+
+    parts_vec = torch.stack(
+        (
+            total_loss.detach(),
+            loss_delay_pred.detach(),
+            loss_delay_post.detach(),
+            loss_edge.detach(),
+            loss_rank.detach(),
+            loss_tau.detach(),
+            loss_spill.detach(),
+            loss_smooth.detach(),
+            loss_l1.detach(),
+        ),
+        dim=0,
+    )
+    return total_loss, parts_vec
+
+
+def _build_vector_carries(
+    step_out: DifferentiableStepOutput,
+    *,
+    detach: bool,
+) -> tuple[TorchTemporalMemory, Tensor, Tensor, Tensor]:
+    """Extract contiguous 1D device carry tensors across steps with zero Python edge loops."""
+    next_mem = step_out.next_memory.detach_state() if detach else step_out.next_memory
+    d_post_vec = step_out.delay_post.detach() if detach else step_out.delay_post
+    om_raw_vec = step_out.omega_raw.detach() if detach else step_out.omega_raw
+    om_det_vec = step_out.omega_raw.detach().float()
+    return next_mem, d_post_vec, om_raw_vec, om_det_vec
+
+
+def _parts_vec_to_dict(parts_vec: Tensor) -> dict[str, float]:
+    vals = parts_vec.detach().cpu().to(torch.float64).tolist()
+    return {k: float(v) for k, v in zip(_LOSS_COMPONENT_KEYS, vals, strict=True)}
+
+
 def _evaluate_validation_episodes(
     *,
     raw_model: STGraphTransformerDBN,
@@ -575,129 +1013,120 @@ def _evaluate_validation_episodes(
     device: torch.device,
     temperatures: TemperatureScales | None = None,
     collect_logits: bool = False,
+    prestaged_episodes: Sequence[Sequence[PrecomputedDeviceStep]] | None = None,
 ) -> tuple[dict[str, float], dict[str, np.ndarray]]:
     """Run full-episode sequential evaluation strictly in ``model.eval()`` hard-DAG mode (Boundary Lock B)."""
     raw_model.eval()
     if raw_model.training:
         raise ConfigValidationError("Boundary Lock B violation: model remained in training mode during validation.")
 
+    episodes_dev = (
+        prestaged_episodes
+        if prestaged_episodes is not None
+        else prestage_rollout_dataset(val_dataset, normalizer, device)
+    )
     temps = temperatures if temperatures is not None else TemperatureScales.uncalibrated_unit()
-    loss_sums: dict[str, float] = {}
+    loss_sums_vec = torch.zeros((len(_LOSS_COMPONENT_KEYS),), dtype=torch.float32, device=device)
     total_steps = 0
 
-    edge_logits_all: list[np.ndarray] = []
-    edge_targets_all: list[np.ndarray] = []
-    delay_logits_all: list[np.ndarray] = []
-    delay_post_logits_all: list[np.ndarray] = []
-    delay_targets_all: list[np.ndarray] = []
-    link_logits_all: list[np.ndarray] = []
-    link_targets_all: list[np.ndarray] = []
+    edge_logits_all: list[Tensor] = []
+    edge_targets_all: list[Tensor] = []
+    delay_logits_all: list[Tensor] = []
+    delay_post_logits_all: list[Tensor] = []
+    delay_targets_all: list[Tensor] = []
+    link_logits_all: list[Tensor] = []
+    link_targets_all: list[Tensor] = []
 
     with torch.no_grad():
-        for episode in val_dataset.episodes:
+        for ep_steps in episodes_dev:
             prev_mem: TorchTemporalMemory | None = None
-            prev_delay: dict[str, Tensor] | None = None
-            prev_omega: dict[tuple[str, str], Tensor] | None = None
-            prev_omega_det: dict[tuple[str, str], Tensor] | None = None
-            prev_sim_time: float | None = None
+            prev_delay_vec: Tensor | None = None
+            prev_omega_vec: Tensor | None = None
+            prev_omega_det_vec: Tensor | None = None
 
-            for fb, lbls in episode:
-                if prev_sim_time is not None and (fb.sim_time - prev_sim_time) > (1.5 * max(fb.dt, 0.05) + 1e-6):
+            for pstep in ep_steps:
+                if not pstep.inputs.is_contiguous_from_prev:
                     prev_mem = None
-                    prev_delay = None
-                    prev_omega = None
-                    prev_omega_det = None
-                prev_sim_time = float(fb.sim_time)
+                    prev_delay_vec = None
+                    prev_omega_vec = None
+                    prev_omega_det_vec = None
 
-                step_out = forward_dbn_step(
+                step_out = forward_dbn_precomputed_step(
                     model=raw_model,
-                    normalizer=normalizer,
-                    feat_batch=fb,
+                    step=pstep.inputs,
                     dbn_cfg=dbn_cfg,
                     temperatures=temps,
                     prev_memory=prev_mem,
-                    prev_delay_post_override=prev_delay,
-                    prev_edge_omega_override=prev_omega,
-                    device=device,
+                    prev_delay_vec=prev_delay_vec,
+                    prev_omega_vec=prev_omega_vec,
                 )
-                _, parts = compute_step_multitask_loss(
+                _, parts_vec = compute_precomputed_step_loss(
                     step_out=step_out,
-                    feat_batch=fb,
-                    labels=lbls,
+                    pstep=pstep,
                     train_cfg=train_cfg,
-                    prev_edge_omega_detached=prev_omega_det,
+                    prev_omega_det_vec=prev_omega_det_vec,
                     device=device,
                 )
-                for k, v in parts.items():
-                    loss_sums[k] = loss_sums.get(k, 0.0) + v
+                loss_sums_vec = loss_sums_vec + parts_vec
                 total_steps += 1
 
                 if collect_logits:
-                    if fb.candidate_graph.num_edges > 0:
-                        edge_logits_all.append(
-                            step_out.transformer_out.edge_logits.detach().cpu().float().numpy().reshape(-1)
-                        )
-                        edge_targets_all.append(lbls["y_edge"].detach().cpu().float().numpy().reshape(-1))
-                    if fb.candidate_graph.num_vehicles > 0:
-                        delay_logits_all.append(
-                            step_out.lbp_result.delay_pred_logits.detach().cpu().float().numpy().reshape(-1)
-                        )
-                        delay_post_logits_all.append(
-                            step_out.lbp_result.delay_post_logits.detach().cpu().float().numpy().reshape(-1)
-                        )
-                        delay_targets_all.append(lbls["y_delay"].detach().cpu().float().numpy().reshape(-1))
-                    if len(fb.corridor_ids) > 0:
+                    if pstep.inputs.num_edges > 0:
+                        edge_logits_all.append(step_out.transformer_out.edge_logits.detach().float().reshape(-1))
+                        edge_targets_all.append(pstep.y_edge.detach().float().reshape(-1))
+                    if pstep.inputs.num_vehicles > 0:
+                        delay_logits_all.append(step_out.lbp_result.delay_pred_logits.detach().float().reshape(-1))
+                        delay_post_logits_all.append(step_out.lbp_result.delay_post_logits.detach().float().reshape(-1))
+                        delay_targets_all.append(pstep.y_delay.detach().float().reshape(-1))
+                    if pstep.inputs.num_corridors > 0:
                         link_logits_all.append(
-                            step_out.transformer_out.corridor_spillback_logits.detach()
-                            .cpu()
-                            .float()
-                            .numpy()
-                            .reshape(-1)
+                            step_out.transformer_out.corridor_spillback_logits.detach().float().reshape(-1)
                         )
-                        link_targets_all.append(lbls["y_spillback"].detach().cpu().float().numpy().reshape(-1))
+                        link_targets_all.append(pstep.y_spill.detach().float().reshape(-1))
 
-                prev_mem, prev_delay, prev_omega, prev_omega_det = _build_step_carries(
-                    step_out, fb, detach=True
+                prev_mem, prev_delay_vec, prev_omega_vec, prev_omega_det_vec = _build_vector_carries(
+                    step_out, detach=True
                 )
 
+    require_finite(loss_sums_vec, "val.loss_sums_vec")
     denom = float(max(1, total_steps))
-    mean_losses = {k: float(v / denom) for k, v in loss_sums.items()}
+    mean_losses = _parts_vec_to_dict(loss_sums_vec / denom)
 
     collected: dict[str, np.ndarray] = {}
     if collect_logits:
         collected = {
             "edge_logits": (
-                np.concatenate(edge_logits_all, axis=0)
+                torch.cat(edge_logits_all, dim=0).cpu().numpy()
                 if edge_logits_all
                 else np.zeros((0,), dtype=np.float32)
             ),
             "edge_targets": (
-                np.concatenate(edge_targets_all, axis=0)
+                torch.cat(edge_targets_all, dim=0).cpu().numpy()
                 if edge_targets_all
                 else np.zeros((0,), dtype=np.float32)
             ),
             "delay_pred_logits": (
-                np.concatenate(delay_logits_all, axis=0)
+                torch.cat(delay_logits_all, dim=0).cpu().numpy()
                 if delay_logits_all
                 else np.zeros((0,), dtype=np.float32)
             ),
             "delay_post_logits": (
-                np.concatenate(delay_post_logits_all, axis=0)
+                torch.cat(delay_post_logits_all, dim=0).cpu().numpy()
                 if delay_post_logits_all
                 else np.zeros((0,), dtype=np.float32)
             ),
             "delay_targets": (
-                np.concatenate(delay_targets_all, axis=0)
+                torch.cat(delay_targets_all, dim=0).cpu().numpy()
                 if delay_targets_all
                 else np.zeros((0,), dtype=np.float32)
             ),
             "link_logits": (
-                np.concatenate(link_logits_all, axis=0)
+                torch.cat(link_logits_all, dim=0).cpu().numpy()
                 if link_logits_all
                 else np.zeros((0,), dtype=np.float32)
             ),
             "link_targets": (
-                np.concatenate(link_targets_all, axis=0)
+                torch.cat(link_targets_all, dim=0).cpu().numpy()
                 if link_targets_all
                 else np.zeros((0,), dtype=np.float32)
             ),
@@ -871,6 +1300,11 @@ def train_neural_dbn(
     # Fit FeatureNormalizer strictly on training feature batches ONLY
     normalizer = FeatureNormalizer().fit(train_dataset.all_feature_batches())
 
+    t_prestage_start = time.perf_counter()
+    train_prestaged = prestage_rollout_dataset(train_dataset, normalizer, device)
+    val_prestaged = prestage_rollout_dataset(val_dataset, normalizer, device)
+    prestage_wall_s = float(time.perf_counter() - t_prestage_start)
+
     raw_model = STGraphTransformerDBN(
         preset=preset_spec,
         prediction_horizon_s=dbn_cfg.prediction_horizon_s,
@@ -900,6 +1334,18 @@ def train_neural_dbn(
     batches_per_epoch = max(1, math.ceil(windows_per_rank / float(train_cfg.batch_size)))
     total_optim_steps = max(1, train_cfg.epochs * batches_per_epoch)
     warmup_steps = int(round(total_optim_steps * train_cfg.warmup_fraction))
+    unit_temps = TemperatureScales.uncalibrated_unit()
+
+    if rank == 0:
+        _LOG.info(
+            "Pre-staged %d train episodes (%d windows) + %d val episodes on %s in %.2fs.",
+            len(train_prestaged),
+            num_windows,
+            len(val_prestaged),
+            device,
+            prestage_wall_s,
+        )
+        _flush_log_streams()
 
     best_val_loss = float("inf")
     best_epoch = 0
@@ -910,6 +1356,7 @@ def train_neural_dbn(
     t_train_start = time.perf_counter()
 
     for epoch in range(1, train_cfg.epochs + 1):
+        t_epoch_start = time.perf_counter()
         raw_model.train()
         if train_cfg.epochs > 1:
             prog = float(epoch - 1) / float(train_cfg.epochs - 1)
@@ -931,7 +1378,7 @@ def train_neural_dbn(
         else:
             rank_indices = perm
 
-        epoch_train_losses: dict[str, float] = {}
+        epoch_train_losses_vec = torch.zeros((len(_LOSS_COMPONENT_KEYS),), dtype=torch.float32, device=device)
         epoch_sup_windows = 0
         last_grad_norm = 0.0
 
@@ -950,15 +1397,16 @@ def train_neural_dbn(
             batch_scale = 1.0 / float(len(batch_win_indices))
 
             for win_idx in batch_win_indices:
-                window = train_dataset.get_window(win_idx)
+                ep_idx, start_i, end_i = train_dataset.windows[win_idx]
+                window = train_prestaged[ep_idx][start_i:end_i]
                 w_len = len(window)
                 eff_burn = 0 if w_len <= preset_spec.t_burn else min(preset_spec.t_burn, w_len - 1)
                 n_sup = max(1, w_len - eff_burn)
 
                 prev_mem: TorchTemporalMemory | None = None
-                prev_delay: dict[str, Tensor] | None = None
-                prev_omega: dict[tuple[str, str], Tensor] | None = None
-                prev_omega_det: dict[tuple[str, str], Tensor] | None = None
+                prev_delay_vec: Tensor | None = None
+                prev_omega_vec: Tensor | None = None
+                prev_omega_det_vec: Tensor | None = None
 
                 # Burn-in steps warm up ContinuousDecayGRU recurrent hidden states without backprop
                 if eff_burn > 0:
@@ -968,66 +1416,59 @@ def train_neural_dbn(
                         enabled=use_bf16,
                     ):
                         for s_i in range(eff_burn):
-                            fb_burn, _ = window[s_i]
-                            out_burn = forward_dbn_step(
+                            pstep_burn = window[s_i]
+                            out_burn = forward_dbn_precomputed_step(
                                 model=forward_model,
-                                normalizer=normalizer,
-                                feat_batch=fb_burn,
+                                step=pstep_burn.inputs,
                                 dbn_cfg=dbn_cfg,
-                                temperatures=TemperatureScales.uncalibrated_unit(),
+                                temperatures=unit_temps,
                                 prev_memory=prev_mem,
-                                prev_delay_post_override=prev_delay,
-                                prev_edge_omega_override=prev_omega,
+                                prev_delay_vec=prev_delay_vec,
+                                prev_omega_vec=prev_omega_vec,
                                 dag_temperature=dag_temp,
-                                device=device,
                             )
-                            prev_mem, prev_delay, prev_omega, prev_omega_det = _build_step_carries(
-                                out_burn, fb_burn, detach=True
+                            prev_mem, prev_delay_vec, prev_omega_vec, prev_omega_det_vec = _build_vector_carries(
+                                out_burn, detach=True
                             )
 
                 # Supervised unrolled BPTT steps
                 win_loss_accum = torch.zeros((), dtype=torch.float32, device=device)
-                win_parts_accum: dict[str, float] = {}
+                win_parts_accum = torch.zeros((len(_LOSS_COMPONENT_KEYS),), dtype=torch.float32, device=device)
                 for s_i in range(eff_burn, w_len):
-                    fb_sup, lbl_sup = window[s_i]
+                    pstep_sup = window[s_i]
                     with torch.autocast(
                         device_type=autocast_device_type,
                         dtype=torch.bfloat16,
                         enabled=use_bf16,
                     ):
-                        out_sup = forward_dbn_step(
+                        out_sup = forward_dbn_precomputed_step(
                             model=forward_model,
-                            normalizer=normalizer,
-                            feat_batch=fb_sup,
+                            step=pstep_sup.inputs,
                             dbn_cfg=dbn_cfg,
-                            temperatures=TemperatureScales.uncalibrated_unit(),
+                            temperatures=unit_temps,
                             prev_memory=prev_mem,
-                            prev_delay_post_override=prev_delay,
-                            prev_edge_omega_override=prev_omega,
+                            prev_delay_vec=prev_delay_vec,
+                            prev_omega_vec=prev_omega_vec,
                             dag_temperature=dag_temp,
-                            device=device,
                         )
-                    step_loss, step_parts = compute_step_multitask_loss(
+                    step_loss, step_parts_vec = compute_precomputed_step_loss(
                         step_out=out_sup,
-                        feat_batch=fb_sup,
-                        labels=lbl_sup,
+                        pstep=pstep_sup,
                         train_cfg=train_cfg,
-                        prev_edge_omega_detached=prev_omega_det,
+                        prev_omega_det_vec=prev_omega_det_vec,
                         device=device,
                     )
                     win_loss_accum = win_loss_accum + step_loss
-                    for pk, pv in step_parts.items():
-                        win_parts_accum[pk] = win_parts_accum.get(pk, 0.0) + pv
-                    prev_mem, prev_delay, prev_omega, prev_omega_det = _build_step_carries(
-                        out_sup, fb_sup, detach=False
+                    win_parts_accum = win_parts_accum + step_parts_vec
+                    prev_mem, prev_delay_vec, prev_omega_vec, prev_omega_det_vec = _build_vector_carries(
+                        out_sup, detach=False
                     )
 
                 mean_win_loss = win_loss_accum / float(n_sup)
                 require_finite(mean_win_loss, "train.mean_win_loss")
                 (mean_win_loss * batch_scale).backward()
 
-                for pk, pv in win_parts_accum.items():
-                    epoch_train_losses[pk] = epoch_train_losses.get(pk, 0.0) + (pv / float(n_sup))
+                epoch_train_losses_vec = epoch_train_losses_vec + (win_parts_accum / float(n_sup))
                 epoch_sup_windows += 1
 
             grad_norm_t = torch.nn.utils.clip_grad_norm_(
@@ -1040,11 +1481,11 @@ def train_neural_dbn(
             optim_step_idx += 1
 
         train_denom = float(max(1, epoch_sup_windows))
-        train_summary = {k: float(v / train_denom) for k, v in epoch_train_losses.items()}
+        mean_train_vec = epoch_train_losses_vec / train_denom
         if is_ddp:
-            t_vec = torch.tensor([train_summary["total"]], dtype=torch.float64, device=device)
-            dist.all_reduce(t_vec, op=dist.ReduceOp.AVG)
-            train_summary["total"] = float(t_vec.item())
+            dist.all_reduce(mean_train_vec, op=dist.ReduceOp.AVG)
+        require_finite(mean_train_vec, f"train.epoch_{epoch}.loss_components")
+        train_summary = _parts_vec_to_dict(mean_train_vec)
 
         val_summary, _ = _evaluate_validation_episodes(
             raw_model=raw_model,
@@ -1054,6 +1495,7 @@ def train_neural_dbn(
             dbn_cfg=dbn_cfg,
             device=device,
             collect_logits=False,
+            prestaged_episodes=val_prestaged,
         )
         val_total = float(val_summary["total"])
         require_finite(val_total, f"val.epoch_{epoch}.total_loss")
@@ -1067,8 +1509,10 @@ def train_neural_dbn(
         else:
             epochs_no_improve += 1
 
+        epoch_wall_s = float(time.perf_counter() - t_epoch_start)
         epoch_rec = {
             "epoch": epoch,
+            "wall_time_s": epoch_wall_s,
             "dag_temperature": dag_temp,
             "lr": float(optimizer.param_groups[0]["lr"]),
             "grad_norm": last_grad_norm,
@@ -1082,9 +1526,10 @@ def train_neural_dbn(
 
         if rank == 0:
             _LOG.info(
-                "Epoch %d/%d: train_loss=%.4f val_loss=%.4f (best=%.4f @ ep %d) dag_T=%.3f grad=%.3f",
+                "Epoch %d/%d [%.2fs]: train_loss=%.4f val_loss=%.4f (best=%.4f @ ep %d) dag_T=%.3f grad=%.3f",
                 epoch,
                 train_cfg.epochs,
+                epoch_wall_s,
                 train_summary["total"],
                 val_total,
                 best_val_loss,
@@ -1092,6 +1537,7 @@ def train_neural_dbn(
                 dag_temp,
                 last_grad_norm,
             )
+            _flush_log_streams()
 
         if epochs_no_improve >= train_cfg.early_stopping_patience:
             if rank == 0:
@@ -1101,6 +1547,7 @@ def train_neural_dbn(
                     train_cfg.early_stopping_patience,
                     best_epoch,
                 )
+                _flush_log_streams()
             break
 
     # Restore best validation weights in FP32 & calibrate post-hoc temperatures strictly in model.eval() (Boundary Lock B)
@@ -1116,6 +1563,7 @@ def train_neural_dbn(
         dbn_cfg=dbn_cfg,
         device=device,
         collect_logits=True,
+        prestaged_episodes=val_prestaged,
     )
 
     if val_logits["edge_logits"].size == 0 or val_logits["delay_pred_logits"].size == 0:
@@ -1374,9 +1822,12 @@ def evaluate_heldout_predictive(
 
 
 __all__ = [
+    "PrecomputedDeviceStep",
     "RolloutSequenceDataset",
+    "compute_precomputed_step_loss",
     "compute_step_multitask_loss",
     "evaluate_heldout_predictive",
+    "prestage_rollout_dataset",
     "shard_step_to_feature_batch",
     "train_neural_dbn",
 ]

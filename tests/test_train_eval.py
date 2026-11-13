@@ -1784,3 +1784,262 @@ def test_test_split_named_splits_and_contiguous_window_cap(
             dataset_dirs={"leaked": tr_dir},
             allow_ci_micro=True,
         )
+
+
+def test_vectorized_precomputed_unrolled_matches_reference_loss_and_grads() -> None:
+    """Assert vectorized PrecomputedDeviceStep BPTT matches reference dict carries to < 1e-5 on loss & grads."""
+    import copy
+    from swarm.dbn.calibration import TemperatureScales
+    from swarm.dbn.features import FeatureNormalizer
+    from swarm.dbn.transformer import STGraphTransformerDBN
+    from swarm.dbn.updater import forward_dbn_precomputed_step, forward_dbn_step
+    from swarm.pipelines.trainer import (
+        RolloutSequenceDataset,
+        _LOSS_COMPONENT_KEYS,
+        _build_step_carries,
+        _build_vector_carries,
+        compute_precomputed_step_loss,
+        compute_step_multitask_loss,
+        prestage_rollout_dataset,
+    )
+
+    rng = np.random.default_rng(20261113)
+    corridor_ids = ("C0", "C1", "C2")
+    corridor_edge_index = torch.tensor([[0, 1], [1, 2]], dtype=torch.long)
+
+    step_specs: list[tuple[tuple[str, ...], list[tuple[int, int]]]] = [
+        (("v0", "v1", "v2", "v3", "v4"), [(0, 1), (1, 2), (2, 3), (3, 4), (0, 2), (1, 0)]),
+        # Step 1: identical vehicles & edges (tests veh_same=True, edge_same=True, and mid-episode window start)
+        (("v0", "v1", "v2", "v3", "v4"), [(0, 1), (1, 2), (2, 3), (3, 4), (0, 2), (1, 0)]),
+        # Step 2: v1 departs, v5 & v6 arrive, order permuted, edges reordered + turnover
+        (("v4", "v0", "v5", "v2", "v3", "v6"), [(1, 3), (3, 4), (2, 5), (0, 1), (4, 2)]),
+        # Step 3: v0 & v3 depart, v7 arrives
+        (("v5", "v2", "v4", "v6", "v7"), [(0, 3), (1, 2), (3, 4), (2, 1)]),
+        # Step 4: zero candidate edges (E_t = 0)
+        (("v5", "v2", "v4", "v6"), []),
+        # Step 5: candidate edges reappear after E_{t-1} = 0
+        (("v2", "v4", "v6", "v8"), [(0, 1), (1, 2), (2, 3), (0, 2)]),
+    ]
+
+    steps: list[dict[str, Any]] = []
+    for s_idx, (veh_ids, pairs) in enumerate(step_specs):
+        n_v = len(veh_ids)
+        e_cand = len(pairs)
+        x_v = rng.normal(0.0, 0.5, size=(n_v, NODE_FEATURE_DIM)).astype(np.float32)
+        x_v[:, 13] = np.clip(rng.uniform(0.05, 0.85, size=n_v), 0.01, 0.99).astype(np.float32)
+        x_c = rng.normal(0.0, 0.4, size=(3, CORRIDOR_FEATURE_DIM)).astype(np.float32)
+        x_c[:, 5:11] = np.clip(rng.uniform(0.05, 0.90, size=(3, 6)), 0.01, 0.99).astype(np.float32)
+        x_cc = rng.uniform(0.1, 0.9, size=(2, CORRIDOR_EDGE_FEATURE_DIM)).astype(np.float32)
+
+        if e_cand > 0:
+            edge_index = torch.tensor([[p[0] for p in pairs], [p[1] for p in pairs]], dtype=torch.long)
+            edge_rel = torch.tensor([k % 4 for k in range(e_cand)], dtype=torch.long)
+            x_e = rng.normal(0.0, 0.4, size=(e_cand, EDGE_FEATURE_DIM)).astype(np.float32)
+            x_e[:, :4] = 0.0
+            for k, r_id in enumerate(edge_rel.tolist()):
+                x_e[k, r_id] = 1.0
+            x_e[:, 8:10] = np.clip(rng.uniform(0.1, 0.9, size=(e_cand, 2)), 0.0, 1.0).astype(np.float32)
+            x_e[:, 15] = np.clip(rng.uniform(0.05, 0.85, size=e_cand), 0.0, 1.0).astype(np.float32)
+            x_e[:, 17] = (rng.uniform(0.0, 1.0, size=e_cand) > 0.4).astype(np.float32)
+            y_edge = torch.from_numpy((rng.uniform(0.0, 1.0, size=e_cand) > 0.5).astype(np.float32))
+        else:
+            edge_index = torch.zeros((2, 0), dtype=torch.long)
+            edge_rel = torch.zeros((0,), dtype=torch.long)
+            x_e = np.zeros((0, EDGE_FEATURE_DIM), dtype=np.float32)
+            y_edge = torch.zeros((0,), dtype=torch.float32)
+
+        y_delay = torch.from_numpy((rng.uniform(0.0, 1.0, size=n_v) > 0.45).astype(np.float32))
+        tau_delay = y_delay * 3.0 + torch.from_numpy(rng.uniform(0.0, 0.8, size=n_v).astype(np.float32))
+        y_spill = torch.tensor([1.0 if s_idx % 2 == 0 else 0.0, 0.0, 1.0], dtype=torch.float32)
+        rank_pairs = torch.tensor([[0, n_v - 1], [1, n_v - 2]], dtype=torch.long)
+
+        steps.append(
+            {
+                "sim_time": float(60.0 + s_idx * 0.5),
+                "veh_ids": veh_ids,
+                "veh_corridor_idx": torch.tensor([i % 3 for i in range(n_v)], dtype=torch.long),
+                "veh_turn_src_idx": torch.tensor([0, 1, 2], dtype=torch.long),
+                "veh_turn_out_corridor_idx": torch.tensor([1, 2, 0], dtype=torch.long),
+                "veh_turn_prob": torch.ones((3,), dtype=torch.float32),
+                "topo_precedence": torch.from_numpy(np.linspace(4.0, -4.0, n_v, dtype=np.float32)),
+                "speed_evidence_pos": torch.from_numpy(rng.uniform(0.15, 0.85, size=n_v).astype(np.float32)),
+                "x_veh": torch.from_numpy(x_v),
+                "x_corridor": torch.from_numpy(x_c),
+                "x_edge": torch.from_numpy(x_e),
+                "x_corridor_edge": torch.from_numpy(x_cc),
+                "edge_index": edge_index,
+                "edge_relations": edge_rel,
+                "y_delay": y_delay,
+                "tau_delay_s": tau_delay,
+                "y_spillback": y_spill,
+                "y_edge": y_edge,
+                "rank_pairs": rank_pairs,
+            }
+        )
+
+    shard = {
+        "schema_version": SCHEMA_VERSION,
+        "split": "train",
+        "scenario_id": "grid3x3_nominal",
+        "network_id": "grid3x3",
+        "seed": TRAIN_SEEDS[0],
+        "behavior_policy": "online_bic_dbn",
+        "dt": 0.5,
+        "corridor_ids": corridor_ids,
+        "corridor_edge_index": corridor_edge_index,
+        "steps": steps,
+    }
+
+    dbn_cfg = DBNConfig(model_preset="ci_micro")
+    train_cfg = TrainConfig(model_preset="ci_micro", seed=123)
+    dataset = RolloutSequenceDataset([shard], dbn_cfg=dbn_cfg, window_len=5, stride=1)
+    normalizer = FeatureNormalizer().fit(dataset.all_feature_batches())
+    device = torch.device("cpu")
+    prestaged = prestage_rollout_dataset(dataset, normalizer, device)
+
+    torch.manual_seed(999)
+    model_ref = STGraphTransformerDBN(preset="ci_micro", prediction_horizon_s=dbn_cfg.prediction_horizon_s).to(device)
+    model_vec = copy.deepcopy(model_ref).to(device)
+    model_ref.train()
+    model_vec.train()
+
+    # Window index 1 starts at step 1 (mid-episode!) with eff_burn=1 and 4 supervised steps (steps 2..5)
+    ep_idx, start_i, end_i = dataset.windows[1]
+    assert (ep_idx, start_i, end_i) == (0, 1, 6)
+    win_ref = dataset.get_window(1)
+    win_vec = prestaged[ep_idx][start_i:end_i]
+    eff_burn = 1
+    dag_temp = 0.35
+    temps = TemperatureScales.uncalibrated_unit()
+
+    # 1. Reference dict-carry unrolled pass
+    prev_mem_r = None
+    prev_delay_r = None
+    prev_omega_r = None
+    prev_omega_det_r = None
+    with torch.no_grad():
+        for s_i in range(eff_burn):
+            torch.manual_seed(5000 + s_i)
+            fb_b, _ = win_ref[s_i]
+            out_b = forward_dbn_step(
+                model=model_ref,
+                normalizer=normalizer,
+                feat_batch=fb_b,
+                dbn_cfg=dbn_cfg,
+                temperatures=temps,
+                prev_memory=prev_mem_r,
+                prev_delay_post_override=prev_delay_r,
+                prev_edge_omega_override=prev_omega_r,
+                dag_temperature=dag_temp,
+                device=device,
+            )
+            prev_mem_r, prev_delay_r, prev_omega_r, prev_omega_det_r = _build_step_carries(
+                out_b, fb_b, detach=True
+            )
+
+    loss_accum_r = torch.zeros((), dtype=torch.float32, device=device)
+    parts_accum_r: dict[str, float] = {k: 0.0 for k in _LOSS_COMPONENT_KEYS}
+    for s_i in range(eff_burn, len(win_ref)):
+        torch.manual_seed(5000 + s_i)
+        fb_s, lbl_s = win_ref[s_i]
+        out_s = forward_dbn_step(
+            model=model_ref,
+            normalizer=normalizer,
+            feat_batch=fb_s,
+            dbn_cfg=dbn_cfg,
+            temperatures=temps,
+            prev_memory=prev_mem_r,
+            prev_delay_post_override=prev_delay_r,
+            prev_edge_omega_override=prev_omega_r,
+            dag_temperature=dag_temp,
+            device=device,
+        )
+        s_loss_r, s_parts_r = compute_step_multitask_loss(
+            step_out=out_s,
+            feat_batch=fb_s,
+            labels=lbl_s,
+            train_cfg=train_cfg,
+            prev_edge_omega_detached=prev_omega_det_r,
+            device=device,
+        )
+        loss_accum_r = loss_accum_r + s_loss_r
+        for k, v in s_parts_r.items():
+            parts_accum_r[k] += v
+        prev_mem_r, prev_delay_r, prev_omega_r, prev_omega_det_r = _build_step_carries(
+            out_s, fb_s, detach=False
+        )
+    mean_loss_r = loss_accum_r / float(len(win_ref) - eff_burn)
+    mean_loss_r.backward()
+
+    # 2. Vectorized precomputed-step unrolled pass
+    prev_mem_v = None
+    prev_delay_v = None
+    prev_omega_v = None
+    prev_omega_det_v = None
+    with torch.no_grad():
+        for s_i in range(eff_burn):
+            torch.manual_seed(5000 + s_i)
+            out_bv = forward_dbn_precomputed_step(
+                model=model_vec,
+                step=win_vec[s_i].inputs,
+                dbn_cfg=dbn_cfg,
+                temperatures=temps,
+                prev_memory=prev_mem_v,
+                prev_delay_vec=prev_delay_v,
+                prev_omega_vec=prev_omega_v,
+                dag_temperature=dag_temp,
+            )
+            prev_mem_v, prev_delay_v, prev_omega_v, prev_omega_det_v = _build_vector_carries(
+                out_bv, detach=True
+            )
+
+    loss_accum_v = torch.zeros((), dtype=torch.float32, device=device)
+    parts_accum_v = torch.zeros((len(_LOSS_COMPONENT_KEYS),), dtype=torch.float32, device=device)
+    for s_i in range(eff_burn, len(win_vec)):
+        torch.manual_seed(5000 + s_i)
+        out_sv = forward_dbn_precomputed_step(
+            model=model_vec,
+            step=win_vec[s_i].inputs,
+            dbn_cfg=dbn_cfg,
+            temperatures=temps,
+            prev_memory=prev_mem_v,
+            prev_delay_vec=prev_delay_v,
+            prev_omega_vec=prev_omega_v,
+            dag_temperature=dag_temp,
+        )
+        s_loss_v, s_parts_v = compute_precomputed_step_loss(
+            step_out=out_sv,
+            pstep=win_vec[s_i],
+            train_cfg=train_cfg,
+            prev_omega_det_vec=prev_omega_det_v,
+            device=device,
+        )
+        loss_accum_v = loss_accum_v + s_loss_v
+        parts_accum_v = parts_accum_v + s_parts_v
+        prev_mem_v, prev_delay_v, prev_omega_v, prev_omega_det_v = _build_vector_carries(
+            out_sv, detach=False
+        )
+    mean_loss_v = loss_accum_v / float(len(win_vec) - eff_burn)
+    mean_loss_v.backward()
+
+    loss_diff = abs(float(mean_loss_v.item()) - float(mean_loss_r.item()))
+    assert loss_diff < 1e-5, f"Total loss mismatch: {loss_diff}"
+
+    for idx_k, key in enumerate(_LOSS_COMPONENT_KEYS):
+        comp_diff = abs(float(parts_accum_v[idx_k].item()) - parts_accum_r[key])
+        assert comp_diff < 1e-5, f"Component {key} mismatch: {comp_diff}"
+
+    max_grad_diff = 0.0
+    checked_grads = 0
+    for (name_r, p_r), (name_v, p_v) in zip(
+        model_ref.named_parameters(), model_vec.named_parameters(), strict=True
+    ):
+        assert name_r == name_v
+        assert (p_r.grad is None) == (p_v.grad is None), f"Grad presence mismatch on {name_r}"
+        if p_r.grad is not None and p_v.grad is not None:
+            diff = float((p_r.grad - p_v.grad).abs().max().item())
+            max_grad_diff = max(max_grad_diff, diff)
+            assert diff < 1e-5, f"Gradient mismatch on {name_r}: {diff}"
+            checked_grads += 1
+    assert checked_grads > 0
+

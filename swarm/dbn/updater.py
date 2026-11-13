@@ -357,9 +357,159 @@ class DifferentiableStepOutput:
     next_memory: TorchTemporalMemory
 
 
+@dataclass(frozen=True)
+class PrecomputedStepInputs:
+    """Pre-staged device tensors and step-to-step alignment indices for zero-overhead unrolled BPTT."""
+
+    sim_time: float
+    dt: float
+    veh_ids: tuple[str, ...]
+    corridor_ids: tuple[str, ...]
+    num_vehicles: int
+    num_corridors: int
+    num_edges: int
+    z_veh: Tensor                        # [N_t, NODE_FEATURE_DIM] float32 on device
+    z_corr: Tensor                       # [N_C, CORRIDOR_FEATURE_DIM] float32 on device
+    z_edge: Tensor                       # [E_t, EDGE_FEATURE_DIM] float32 on device
+    z_cc: Tensor                         # [E_C, CORRIDOR_EDGE_FEATURE_DIM] float32 on device
+    x_corr_raw: Tensor                   # [N_C, CORRIDOR_FEATURE_DIM] float32 on device
+    x_edge_raw: Tensor | None            # [E_t, EDGE_FEATURE_DIM] float32 on device when needed
+    edge_index: Tensor                   # [2, E_t] int64 on device
+    corr_edge_index: Tensor              # [2, E_C] int64 on device
+    veh_corridor_idx: Tensor             # [N_t] int64 on device
+    veh_turn_src_idx: Tensor             # [T_nz] int64 on device
+    veh_turn_out_corridor_idx: Tensor    # [T_nz] int64 on device
+    veh_turn_prob: Tensor                # [T_nz] float32 on device
+    topo_precedence: Tensor              # [N_t] float32 on device
+    speed_evidence_pos: Tensor           # [N_t] float32 on device
+    base_prev_delay_post: Tensor         # [N_t] float32 on device
+    base_prior_edge_prob: Tensor         # [E_t] float32 on device
+    is_contiguous_from_prev: bool
+    veh_same: bool
+    veh_curr_idx: Tensor                 # [M_v] int64 on device
+    veh_prev_idx: Tensor                 # [M_v] int64 on device
+    corr_same: bool
+    corr_curr_idx: Tensor                # [M_c] int64 on device
+    corr_prev_idx: Tensor                # [M_c] int64 on device
+    edge_same: bool
+    edge_curr_idx: Tensor                # [M_e] int64 on device
+    edge_prev_idx: Tensor                # [M_e] int64 on device
+
+
+def _run_post_transformer_cpd_lbp(
+    *,
+    tf_out: TransformerStepOutputs,
+    edge_index: Tensor,
+    turn_src_idx: Tensor,
+    turn_out_c_idx: Tensor,
+    turn_prob: Tensor,
+    prev_delay_t: Tensor,
+    ev_pos: Tensor,
+    x_edge_raw_t: Tensor | None,
+    n_v: int,
+    dbn_cfg: DBNConfig,
+    temps: TemperatureScales,
+    use_static_cpd: bool,
+    training: bool,
+    dag_temperature: float,
+    dev: torch.device,
+) -> DifferentiableStepOutput:
+    """Shared FP32 CPD parameterization, DAG pruning, and multiplicative sum-product LBP stage."""
+    with torch.autocast(device_type=dev.type, enabled=False):
+        edge_logits_scaled = tf_out.edge_logits.float() / float(temps.t_edge)
+        omega_raw = torch.sigmoid(edge_logits_scaled)
+
+        corr_logits_scaled = tf_out.corridor_spillback_logits.float() / float(temps.t_link)
+        corr_spill_prob = torch.sigmoid(corr_logits_scaled)
+
+        exp_down_spill = expected_downstream_spillback(
+            corr_spill_prob,
+            turn_src_idx,
+            turn_out_c_idx,
+            turn_prob.float(),
+            n_v,
+        )
+
+        if use_static_cpd:
+            if x_edge_raw_t is None:
+                raise ConfigValidationError(
+                    "use_static_cpd=True requires raw edge features x_edge_raw_t."
+                )
+            leak_t = torch.full((n_v,), STATIC_CPD_BASE_LEAK, dtype=torch.float32, device=dev)
+            persist_t = torch.full((n_v,), STATIC_CPD_PERSIST_WEIGHT, dtype=torch.float32, device=dev)
+            spill_w_t = torch.full((n_v,), STATIC_CPD_SPILL_WEIGHT, dtype=torch.float32, device=dev)
+            kappa_t, gamma_t = static_edge_cpd_parameters(x_edge_raw_t.float())
+        else:
+            leak_t = tf_out.leak_prob.float()
+            persist_t = tf_out.self_persist_prob.float()
+            spill_w_t = tf_out.spill_weight.float()
+            kappa_t = tf_out.kappa.float()
+            gamma_t = tf_out.gamma.float()
+
+        z0 = generalized_noisy_or_base_survival(
+            leak_prob=leak_t,
+            self_persist_prob=persist_t,
+            prev_delay_post=prev_delay_t.float(),
+            spill_weight=spill_w_t,
+            expected_down_spill=exp_down_spill,
+        )
+
+        pruned = gate_and_prune_edges(
+            edge_index=edge_index,
+            precedence=tf_out.precedence.float(),
+            omega_raw=omega_raw,
+            kappa=kappa_t,
+            gamma=gamma_t,
+            num_vehicles=n_v,
+            max_parents_k=dbn_cfg.max_parents_k,
+            min_edge_prob=dbn_cfg.min_edge_prob,
+            training=training,
+            dag_temperature=dag_temperature,
+        )
+
+        lbp_res = multiplicative_sum_product_lbp(
+            base_survival_z0=z0,
+            pruned_dag=pruned,
+            speed_evidence_pos=ev_pos.float(),
+            lbp_sweeps=dbn_cfg.lbp_sweeps,
+            lbp_damping=dbn_cfg.lbp_damping,
+        )
+
+        delay_pred_logits_scaled = lbp_res.delay_pred_logits / float(temps.t_delay)
+        delay_post_logits_scaled = lbp_res.delay_post_logits / float(temps.t_delay)
+        if abs(float(temps.t_delay) - 1.0) <= 1e-8:
+            delay_pred_cal = lbp_res.delay_pred
+            delay_post_cal = lbp_res.delay_post
+        else:
+            delay_pred_cal = torch.sigmoid(delay_pred_logits_scaled)
+            delay_post_cal = torch.sigmoid(delay_post_logits_scaled)
+
+        require_probability_range(delay_pred_cal, "forward_dbn_step.delay_pred")
+        require_probability_range(delay_post_cal, "forward_dbn_step.delay_post")
+
+    return DifferentiableStepOutput(
+        transformer_out=tf_out,
+        edge_logits_scaled=edge_logits_scaled,
+        omega_raw=omega_raw,
+        corridor_spillback_logits_scaled=corr_logits_scaled,
+        corridor_spillback_prob=corr_spill_prob,
+        expected_down_spill=exp_down_spill,
+        base_survival_z0=z0,
+        pruned_dag=pruned,
+        lbp_result=lbp_res,
+        delay_pred_logits_scaled=delay_pred_logits_scaled,
+        delay_pred=delay_pred_cal,
+        delay_post_logits_scaled=delay_post_logits_scaled,
+        delay_post=delay_post_cal,
+        expected_delay_s=tf_out.expected_delay_s,
+        cascade_score=lbp_res.cascade_score,
+        next_memory=tf_out.next_memory,
+    )
+
+
 def forward_dbn_step(
     *,
-    model: STGraphTransformerDBN,
+    model: Any,
     normalizer: FeatureNormalizer,
     feat_batch: GraphFeatureBatch,
     dbn_cfg: DBNConfig = DBNConfig(),
@@ -480,92 +630,133 @@ def forward_dbn_step(
         prev_memory=active_prev_mem,
     )
 
-    with torch.autocast(device_type=dev.type, enabled=False):
-        edge_logits_scaled = tf_out.edge_logits.float() / float(temps.t_edge)
-        omega_raw = torch.sigmoid(edge_logits_scaled)
+    x_edge_raw_t = (
+        torch.as_tensor(feat_batch.x_edge, dtype=torch.float32, device=dev)
+        if use_static_cpd
+        else None
+    )
+    return _run_post_transformer_cpd_lbp(
+        tf_out=tf_out,
+        edge_index=edge_index,
+        turn_src_idx=turn_src_idx,
+        turn_out_c_idx=turn_out_c_idx,
+        turn_prob=turn_prob,
+        prev_delay_t=prev_delay_t,
+        ev_pos=ev_pos,
+        x_edge_raw_t=x_edge_raw_t,
+        n_v=n_v,
+        dbn_cfg=dbn_cfg,
+        temps=temps,
+        use_static_cpd=use_static_cpd,
+        training=bool(model.training),
+        dag_temperature=dag_temperature,
+        dev=dev,
+    )
 
-        corr_logits_scaled = tf_out.corridor_spillback_logits.float() / float(temps.t_link)
-        corr_spill_prob = torch.sigmoid(corr_logits_scaled)
 
-        exp_down_spill = expected_downstream_spillback(
-            corr_spill_prob,
-            turn_src_idx,
-            turn_out_c_idx,
-            turn_prob.float(),
-            n_v,
-        )
+def forward_dbn_precomputed_step(
+    *,
+    model: Any,
+    step: PrecomputedStepInputs,
+    dbn_cfg: DBNConfig = DBNConfig(),
+    temperatures: TemperatureScales | None = None,
+    prev_memory: TorchTemporalMemory | DBNTemporalMemory | None = None,
+    prev_delay_vec: Tensor | None = None,
+    prev_omega_vec: Tensor | None = None,
+    use_static_cpd: bool = False,
+    reset_temporal_prior: bool = False,
+    dag_temperature: float = 0.50,
+) -> DifferentiableStepOutput:
+    """Execute one zero-Python-loop differentiable DBN step on pre-staged device tensors."""
+    temps = temperatures if temperatures is not None else TemperatureScales.uncalibrated_unit()
+    dev = step.z_veh.device
+    n_v = step.num_vehicles
+    e_cand = step.num_edges
 
-        if use_static_cpd:
-            leak_t = torch.full((n_v,), STATIC_CPD_BASE_LEAK, dtype=torch.float32, device=dev)
-            persist_t = torch.full((n_v,), STATIC_CPD_PERSIST_WEIGHT, dtype=torch.float32, device=dev)
-            spill_w_t = torch.full((n_v,), STATIC_CPD_SPILL_WEIGHT, dtype=torch.float32, device=dev)
-            x_edge_raw_t = torch.as_tensor(feat_batch.x_edge, dtype=torch.float32, device=dev)
-            kappa_t, gamma_t = static_edge_cpd_parameters(x_edge_raw_t)
+    if reset_temporal_prior:
+        prev_delay_t = torch.full((n_v,), float(dbn_cfg.prior_base_prob), dtype=torch.float32, device=dev)
+        prior_edge_t = torch.full((e_cand,), float(dbn_cfg.prior_base_prob), dtype=torch.float32, device=dev)
+        active_prev_mem: TorchTemporalMemory | DBNTemporalMemory | None = None
+    else:
+        active_prev_mem = prev_memory
+        if prev_delay_vec is not None and n_v > 0:
+            if step.veh_same and prev_delay_vec.shape[0] == n_v:
+                prev_delay_t = prev_delay_vec.to(device=dev, dtype=torch.float32)
+            elif step.veh_curr_idx.numel() > 0:
+                val_t = prev_delay_vec.to(device=dev, dtype=torch.float32).index_select(0, step.veh_prev_idx)
+                prev_delay_t = step.base_prev_delay_post.index_put((step.veh_curr_idx,), val_t)
+            else:
+                prev_delay_t = step.base_prev_delay_post
         else:
-            leak_t = tf_out.leak_prob.float()
-            persist_t = tf_out.self_persist_prob.float()
-            spill_w_t = tf_out.spill_weight.float()
-            kappa_t = tf_out.kappa.float()
-            gamma_t = tf_out.gamma.float()
+            prev_delay_t = step.base_prev_delay_post
 
-        z0 = generalized_noisy_or_base_survival(
-            leak_prob=leak_t,
-            self_persist_prob=persist_t,
-            prev_delay_post=prev_delay_t.float(),
-            spill_weight=spill_w_t,
-            expected_down_spill=exp_down_spill,
-        )
-
-        pruned = gate_and_prune_edges(
-            edge_index=edge_index,
-            precedence=tf_out.precedence.float(),
-            omega_raw=omega_raw,
-            kappa=kappa_t,
-            gamma=gamma_t,
-            num_vehicles=n_v,
-            max_parents_k=dbn_cfg.max_parents_k,
-            min_edge_prob=dbn_cfg.min_edge_prob,
-            training=bool(model.training),
-            dag_temperature=dag_temperature,
-        )
-
-        lbp_res = multiplicative_sum_product_lbp(
-            base_survival_z0=z0,
-            pruned_dag=pruned,
-            speed_evidence_pos=ev_pos.float(),
-            lbp_sweeps=dbn_cfg.lbp_sweeps,
-            lbp_damping=dbn_cfg.lbp_damping,
-        )
-
-        delay_pred_logits_scaled = lbp_res.delay_pred_logits / float(temps.t_delay)
-        delay_post_logits_scaled = lbp_res.delay_post_logits / float(temps.t_delay)
-        if abs(float(temps.t_delay) - 1.0) <= 1e-8:
-            delay_pred_cal = lbp_res.delay_pred
-            delay_post_cal = lbp_res.delay_post
+        if prev_omega_vec is not None and e_cand > 0:
+            if step.edge_same and prev_omega_vec.shape[0] == e_cand:
+                prev_w = prev_omega_vec.to(device=dev, dtype=torch.float32)
+                pers_m = torch.ones((e_cand,), dtype=torch.float32, device=dev)
+            else:
+                prev_w = torch.full((e_cand,), float(dbn_cfg.prior_base_prob), dtype=torch.float32, device=dev)
+                pers_m = torch.zeros((e_cand,), dtype=torch.float32, device=dev)
+                if step.edge_curr_idx.numel() > 0:
+                    e_val_t = prev_omega_vec.to(device=dev, dtype=torch.float32).index_select(0, step.edge_prev_idx)
+                    prev_w = prev_w.index_put((step.edge_curr_idx,), e_val_t)
+                    pers_m = pers_m.index_put((step.edge_curr_idx,), torch.ones_like(e_val_t))
+            prior_edge_t = temporal_edge_prior(
+                prev_w,
+                pers_m,
+                prior_stay_prob=dbn_cfg.prior_stay_prob,
+                prior_base_prob=dbn_cfg.prior_base_prob,
+            )  # type: ignore[assignment]
         else:
-            delay_pred_cal = torch.sigmoid(delay_pred_logits_scaled)
-            delay_post_cal = torch.sigmoid(delay_post_logits_scaled)
+            prior_edge_t = step.base_prior_edge_prob
 
-        require_probability_range(delay_pred_cal, "forward_dbn_step.delay_pred")
-        require_probability_range(delay_post_cal, "forward_dbn_step.delay_post")
+    tf_out = model(
+        z_veh=step.z_veh,
+        z_corridor=step.z_corr,
+        z_edge=step.z_edge,
+        z_corridor_edge=step.z_cc,
+        x_corridor_raw=step.x_corr_raw,
+        edge_index=step.edge_index,
+        corridor_edge_index=step.corr_edge_index,
+        veh_corridor_idx=step.veh_corridor_idx,
+        veh_turn_src_idx=step.veh_turn_src_idx,
+        veh_turn_out_corridor_idx=step.veh_turn_out_corridor_idx,
+        veh_turn_prob=step.veh_turn_prob,
+        topo_precedence=step.topo_precedence,
+        prior_edge_prob=prior_edge_t,
+        veh_ids=step.veh_ids,
+        corridor_ids=step.corridor_ids,
+        sim_time=step.sim_time,
+        dt=step.dt,
+        prev_memory=active_prev_mem,
+        veh_curr_idx=step.veh_curr_idx,
+        veh_prev_idx=step.veh_prev_idx,
+        veh_same=step.veh_same,
+        corr_curr_idx=step.corr_curr_idx,
+        corr_prev_idx=step.corr_prev_idx,
+        corr_same=step.corr_same,
+        edge_curr_idx=step.edge_curr_idx,
+        edge_prev_idx=step.edge_prev_idx,
+        edge_same=step.edge_same,
+        skip_edge_keys=True,
+    )
 
-    return DifferentiableStepOutput(
-        transformer_out=tf_out,
-        edge_logits_scaled=edge_logits_scaled,
-        omega_raw=omega_raw,
-        corridor_spillback_logits_scaled=corr_logits_scaled,
-        corridor_spillback_prob=corr_spill_prob,
-        expected_down_spill=exp_down_spill,
-        base_survival_z0=z0,
-        pruned_dag=pruned,
-        lbp_result=lbp_res,
-        delay_pred_logits_scaled=delay_pred_logits_scaled,
-        delay_pred=delay_pred_cal,
-        delay_post_logits_scaled=delay_post_logits_scaled,
-        delay_post=delay_post_cal,
-        expected_delay_s=tf_out.expected_delay_s,
-        cascade_score=lbp_res.cascade_score,
-        next_memory=tf_out.next_memory,
+    return _run_post_transformer_cpd_lbp(
+        tf_out=tf_out,
+        edge_index=step.edge_index,
+        turn_src_idx=step.veh_turn_src_idx,
+        turn_out_c_idx=step.veh_turn_out_corridor_idx,
+        turn_prob=step.veh_turn_prob,
+        prev_delay_t=prev_delay_t,
+        ev_pos=step.speed_evidence_pos,
+        x_edge_raw_t=step.x_edge_raw,
+        n_v=n_v,
+        dbn_cfg=dbn_cfg,
+        temps=temps,
+        use_static_cpd=use_static_cpd,
+        training=bool(model.training),
+        dag_temperature=dag_temperature,
+        dev=dev,
     )
 
 
@@ -790,7 +981,9 @@ __all__ = [
     "DBNCheckpointBundle",
     "DifferentiableStepOutput",
     "NeuralDBNUpdater",
+    "PrecomputedStepInputs",
     "build_dbn_updater",
+    "forward_dbn_precomputed_step",
     "forward_dbn_step",
     "load_dbn_checkpoint",
     "save_dbn_checkpoint",

@@ -554,6 +554,32 @@ def _align_entity_memory(
     return aligned.index_put((curr_idx_t,), decayed)
 
 
+def _align_entity_memory_indexed(
+    n_curr: int,
+    prev_hidden: Tensor,
+    gru_module: ContinuousDecayGRU,
+    *,
+    curr_idx: Tensor | None,
+    prev_idx: Tensor | None,
+    same_order: bool,
+    delta_t: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    """Vectorized O(|matched|) recurrent state alignment using precomputed index tensors."""
+    if n_curr == 0:
+        return gru_module.init_state(0, device=device, dtype=dtype)
+    if prev_hidden.shape[0] == 0:
+        return gru_module.init_state(n_curr, device=device, dtype=dtype)
+    if same_order and prev_hidden.shape[0] == n_curr:
+        return gru_module.decay(prev_hidden.to(device=device, dtype=dtype), delta_t)
+    aligned = gru_module.init_state(n_curr, device=device, dtype=dtype)
+    if curr_idx is None or prev_idx is None or curr_idx.numel() == 0:
+        return aligned
+    decayed = gru_module.decay(prev_hidden.to(device=device, dtype=dtype).index_select(0, prev_idx), delta_t)
+    return aligned.index_put((curr_idx,), decayed)
+
+
 class STGraphTransformerDBN(nn.Module):
     """Publication-grade Heterogeneous Spatio-Temporal Edge-Augmented Graph Transformer for DBNs."""
 
@@ -687,6 +713,16 @@ class STGraphTransformerDBN(nn.Module):
         sim_time: float,
         dt: float,
         prev_memory: TorchTemporalMemory | DBNTemporalMemory | None = None,
+        veh_curr_idx: Tensor | None = None,
+        veh_prev_idx: Tensor | None = None,
+        veh_same: bool = False,
+        corr_curr_idx: Tensor | None = None,
+        corr_prev_idx: Tensor | None = None,
+        corr_same: bool = False,
+        edge_curr_idx: Tensor | None = None,
+        edge_prev_idx: Tensor | None = None,
+        edge_same: bool = False,
+        skip_edge_keys: bool = False,
     ) -> TransformerStepOutputs:
         """Execute one full spatio-temporal forward pass of ``STGraphTransformerDBN``."""
         n_v = z_veh.shape[0]
@@ -724,8 +760,8 @@ class STGraphTransformerDBN(nn.Module):
             else float(dt)
         )
 
-        # Build canonical candidate edge keys (src_id, dst_id) for temporal edge state alignment
-        if e_cand > 0:
+        # Build canonical candidate edge keys (src_id, dst_id) only when online dict alignment needs them
+        if e_cand > 0 and not skip_edge_keys:
             src_cpu = edge_index[0].detach().cpu().tolist()
             dst_cpu = edge_index[1].detach().cpu().tolist()
             edge_keys: tuple[tuple[str, str], ...] = tuple(
@@ -751,33 +787,74 @@ class STGraphTransformerDBN(nn.Module):
             prev_c_h = self.corridor_gru.init_state(n_c, device=device, dtype=dtype)
             prev_e_h = self.edge_gru.init_state(e_cand, device=device, dtype=dtype)
         else:
-            prev_v_h = _align_entity_memory(
-                veh_ids,
-                torch_prev.veh_ids,
-                torch_prev.veh_hidden,
-                self.veh_gru,
-                delta_t=delta_t,
-                device=device,
-                dtype=dtype,
-            )
-            prev_c_h = _align_entity_memory(
-                corridor_ids,
-                torch_prev.corridor_ids,
-                torch_prev.corridor_hidden,
-                self.corridor_gru,
-                delta_t=delta_t,
-                device=device,
-                dtype=dtype,
-            )
-            prev_e_h = _align_entity_memory(
-                edge_keys,
-                torch_prev.edge_keys,
-                torch_prev.edge_hidden,
-                self.edge_gru,
-                delta_t=delta_t,
-                device=device,
-                dtype=dtype,
-            )
+            if veh_same or (veh_curr_idx is not None and veh_prev_idx is not None):
+                prev_v_h = _align_entity_memory_indexed(
+                    n_v,
+                    torch_prev.veh_hidden,
+                    self.veh_gru,
+                    curr_idx=veh_curr_idx,
+                    prev_idx=veh_prev_idx,
+                    same_order=veh_same,
+                    delta_t=delta_t,
+                    device=device,
+                    dtype=dtype,
+                )
+            else:
+                prev_v_h = _align_entity_memory(
+                    veh_ids,
+                    torch_prev.veh_ids,
+                    torch_prev.veh_hidden,
+                    self.veh_gru,
+                    delta_t=delta_t,
+                    device=device,
+                    dtype=dtype,
+                )
+
+            if corr_same or (corr_curr_idx is not None and corr_prev_idx is not None):
+                prev_c_h = _align_entity_memory_indexed(
+                    n_c,
+                    torch_prev.corridor_hidden,
+                    self.corridor_gru,
+                    curr_idx=corr_curr_idx,
+                    prev_idx=corr_prev_idx,
+                    same_order=corr_same,
+                    delta_t=delta_t,
+                    device=device,
+                    dtype=dtype,
+                )
+            else:
+                prev_c_h = _align_entity_memory(
+                    corridor_ids,
+                    torch_prev.corridor_ids,
+                    torch_prev.corridor_hidden,
+                    self.corridor_gru,
+                    delta_t=delta_t,
+                    device=device,
+                    dtype=dtype,
+                )
+
+            if edge_same or (edge_curr_idx is not None and edge_prev_idx is not None):
+                prev_e_h = _align_entity_memory_indexed(
+                    e_cand,
+                    torch_prev.edge_hidden,
+                    self.edge_gru,
+                    curr_idx=edge_curr_idx,
+                    prev_idx=edge_prev_idx,
+                    same_order=edge_same,
+                    delta_t=delta_t,
+                    device=device,
+                    dtype=dtype,
+                )
+            else:
+                prev_e_h = _align_entity_memory(
+                    edge_keys,
+                    torch_prev.edge_keys,
+                    torch_prev.edge_hidden,
+                    self.edge_gru,
+                    delta_t=delta_t,
+                    device=device,
+                    dtype=dtype,
+                )
 
         mem_v_h = self.veh_gru(stem_v, prev_v_h)
         mem_c_h = self.corridor_gru(stem_c, prev_c_h)
