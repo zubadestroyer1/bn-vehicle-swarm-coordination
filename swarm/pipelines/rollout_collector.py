@@ -58,9 +58,9 @@ from ..logging_utils import (
     require_shape,
     update_crash_context,
 )
-from .labels import compute_episode_causal_labels
+from .labels import compute_step_causal_labels
 
-RolloutSplit = Literal["train", "val", "eval_id", "eval_ood"]
+RolloutSplit = Literal["train", "val", "eval_id", "eval_ood", "test"]
 
 
 def validate_rollout_split(
@@ -69,9 +69,9 @@ def validate_rollout_split(
     split: RolloutSplit,
 ) -> tuple[int, ...]:
     """Enforce strict seed-split and ID/OOD topology separation; raise ``ConfigValidationError`` on leak."""
-    if split not in ("train", "val", "eval_id", "eval_ood"):
+    if split not in ("train", "val", "eval_id", "eval_ood", "test"):
         raise ConfigValidationError(
-            f"Invalid rollout split {split!r}; expected 'train', 'val', 'eval_id', or 'eval_ood'.",
+            f"Invalid rollout split {split!r}; expected 'train', 'val', 'eval_id', 'eval_ood', or 'test'.",
             context={"split": split},
         )
     if not seeds:
@@ -143,11 +143,11 @@ def validate_rollout_split(
             )
         if scenario.is_ood_regime:
             raise ConfigValidationError(
-                f"Scenario {scenario.scenario_id!r} has is_ood_regime=True; pass split='eval_ood' instead.",
+                f"Scenario {scenario.scenario_id!r} has is_ood_regime=True; pass split='eval_ood' or 'test' instead.",
                 context={"split": split, "scenario_id": scenario.scenario_id},
             )
 
-    else:  # eval_ood
+    elif split == "eval_ood":
         illegal = sorted(seed_set - set(TEST_SEEDS))
         if illegal:
             raise ConfigValidationError(
@@ -156,8 +156,16 @@ def validate_rollout_split(
             )
         if not scenario.is_ood_regime:
             raise ConfigValidationError(
-                f"Scenario {scenario.scenario_id!r} has is_ood_regime=False; pass split='eval_id' instead.",
+                f"Scenario {scenario.scenario_id!r} has is_ood_regime=False; pass split='eval_id' or 'test' instead.",
                 context={"split": split, "scenario_id": scenario.scenario_id},
+            )
+
+    else:  # split == "test" (held-out predictive evaluation on TEST_SEEDS across ID or OOD; blocked from train/val)
+        illegal = sorted(seed_set - set(TEST_SEEDS))
+        if illegal:
+            raise ConfigValidationError(
+                f"Held-out test seed-leak guard: seeds {illegal} are outside TEST_SEEDS (3000..3014).",
+                context={"split": split, "illegal_seeds": illegal},
             )
 
     return tuple(clean_seeds)
@@ -472,6 +480,52 @@ def _unpack_extracted_features(
     }
 
 
+def _select_contiguous_window_indices(
+    n_active: int,
+    *,
+    max_windows_per_episode: int | None,
+    window_len_steps: int,
+    horizon_steps: int,
+) -> list[int]:
+    """Select evenly spaced non-overlapping contiguous ``window_len_steps`` segments across an episode."""
+    if max_windows_per_episode is None:
+        return list(range(n_active))
+    if max_windows_per_episode < 1 or window_len_steps < 1:
+        raise ConfigValidationError(
+            f"Require max_windows_per_episode >= 1 and window_len_steps >= 1, "
+            f"got ({max_windows_per_episode}, {window_len_steps})."
+        )
+
+    # Prefer placing windows inside [0, n_active - horizon_steps) when long enough so every supervised
+    # frame has a full un-truncated future horizon [t, t + H_p].
+    usable_end = (
+        n_active - horizon_steps
+        if n_active >= max_windows_per_episode * window_len_steps + horizon_steps
+        else n_active
+    )
+    if usable_end <= max_windows_per_episode * window_len_steps:
+        return list(range(min(n_active, max_windows_per_episode * window_len_steps)))
+
+    max_start = usable_end - window_len_steps
+    if max_windows_per_episode == 1:
+        starts = [max_start // 2]
+    else:
+        raw_starts = np.linspace(0, max_start, num=max_windows_per_episode)
+        starts = []
+        next_free = 0
+        for rs in raw_starts:
+            st = max(next_free, int(round(float(rs))))
+            if st + window_len_steps > usable_end:
+                break
+            starts.append(st)
+            next_free = st + window_len_steps
+
+    indices: list[int] = []
+    for st in starts:
+        indices.extend(range(st, st + window_len_steps))
+    return indices
+
+
 def collect_single_rollout_episode(
     exp_cfg: ExperimentConfig,
     seed: int,
@@ -479,6 +533,8 @@ def collect_single_rollout_episode(
     output_dir: Path,
     *,
     behavior_policy_override: str | None = None,
+    max_windows_per_episode: int | None = None,
+    window_len_steps: int = 16,
     adapter_factory: Callable[..., Any] | None = None,
     tracker_factory: Callable[..., Any] | None = None,
     controller_factory: Callable[..., Any] | None = None,
@@ -595,7 +651,7 @@ def collect_single_rollout_episode(
     exp_rng = np.random.default_rng(seed * 1009 + 17)
     belief_steps: list[SwarmBeliefState] = []
     gt_steps = []
-    step_raw_features: list[Any] = []
+    prev_snaps: list[Any] = []
 
     tracker.reset()
     controller.reset()
@@ -616,27 +672,11 @@ def collect_single_rollout_episode(
             if exploratory:
                 action = _apply_exploratory_perturbation(action, obs, belief, topology, exp_rng)
 
-            # Record post-warmup & drain-active trajectory steps where vehicles are present
+            # Record full 0.5s trajectory belief & ground-truth steps where vehicles are present
             if obs.sim_time >= scenario.warmup_duration_s and len(belief.vehicles) > 0:
-                prev_edge_probs = prev_snap.raw_edge_probs if prev_snap is not None else {}
-                prev_delay_post = prev_snap.delay_post if prev_snap is not None else {}
-                prev_spillback = prev_snap.corridor_spillback_pred if prev_snap is not None else {}
-                raw_feats = _bind_and_call(
-                    feature_extractor_fn,
-                    {
-                        "belief": belief,
-                        "topology": topology,
-                        "dbn_cfg": exp_cfg.dbn,
-                        "config": exp_cfg.dbn,
-                        "prev_edge_probs": prev_edge_probs,
-                        "prev_delay_post": prev_delay_post,
-                        "prev_spillback_prob": prev_spillback,
-                        "prev_snapshot": prev_snap,
-                    },
-                )
                 belief_steps.append(belief)
                 gt_steps.append(gt_rec)
-                step_raw_features.append(raw_feats)
+                prev_snaps.append(prev_snap)
 
             tracker.predict(
                 dt=obs.dt,
@@ -656,77 +696,86 @@ def collect_single_rollout_episode(
             context={"scenario_id": scenario.scenario_id, "seed": seed, "split": split},
         )
 
-    unpacked_steps = [_unpack_extracted_features(rf, b, topology) for rf, b in zip(step_raw_features, belief_steps, strict=True)]
-    corridor_ids = tuple(unpacked_steps[0]["corridor_ids"])
-    corridor_edge_index = unpacked_steps[0]["corridor_edge_index"]
-
-    veh_orders = [tuple(u["veh_ids"]) for u in unpacked_steps]
-    cand_by_step = [tuple(u["cand_triples"]) for u in unpacked_steps]
-
-    labels_by_step = compute_episode_causal_labels(
-        belief_steps=belief_steps,
-        gt_steps=gt_steps,
-        topology=topology,
-        candidate_edges_by_step=cand_by_step,
-        corridor_order=corridor_ids,
-        veh_orders_by_step=veh_orders,
-        horizon_s=exp_cfg.dbn.prediction_horizon_s,
-        delay_threshold_s=exp_cfg.dbn.delay_threshold_s,
+    horizon_steps = max(1, int(round(exp_cfg.dbn.prediction_horizon_s / max(scenario.step_length_s, 0.1))))
+    selected_indices = _select_contiguous_window_indices(
+        len(belief_steps),
+        max_windows_per_episode=max_windows_per_episode,
+        window_len_steps=window_len_steps,
+        horizon_steps=horizon_steps,
     )
 
+    unpacked_steps: list[dict[str, Any]] = []
+    for t_idx in selected_indices:
+        b_t = belief_steps[t_idx]
+        ps_t = prev_snaps[t_idx]
+        prev_edge_probs = ps_t.raw_edge_probs if ps_t is not None else {}
+        prev_delay_post = ps_t.delay_post if ps_t is not None else {}
+        prev_spillback = ps_t.corridor_spillback_pred if ps_t is not None else {}
+        raw_feats = _bind_and_call(
+            feature_extractor_fn,
+            {
+                "belief": b_t,
+                "topology": topology,
+                "dbn_cfg": exp_cfg.dbn,
+                "config": exp_cfg.dbn,
+                "prev_edge_probs": prev_edge_probs,
+                "prev_delay_post": prev_delay_post,
+                "prev_spillback_prob": prev_spillback,
+                "prev_snapshot": ps_t,
+            },
+        )
+        unpacked_steps.append(_unpack_extracted_features(raw_feats, b_t, topology))
+
+    corridor_ids = tuple(unpacked_steps[0]["corridor_ids"])
+    corridor_edge_index = unpacked_steps[0]["corridor_edge_index"].to(dtype=torch.int32)
+
     serialized_steps: list[dict[str, Any]] = []
-    for b_step, unpacked, lbl in zip(belief_steps, unpacked_steps, labels_by_step, strict=True):
+    for t_idx, unpacked in zip(selected_indices, unpacked_steps, strict=True):
+        b_step = belief_steps[t_idx]
         veh_ids = tuple(unpacked["veh_ids"])
+        lbl = compute_step_causal_labels(
+            step_idx=t_idx,
+            belief_steps=belief_steps,
+            gt_steps=gt_steps,
+            topology=topology,
+            candidate_edges=tuple(unpacked["cand_triples"]),
+            corridor_order=corridor_ids,
+            veh_order=veh_ids,
+            horizon_s=exp_cfg.dbn.prediction_horizon_s,
+            delay_threshold_s=exp_cfg.dbn.delay_threshold_s,
+        )
+
         x_v: torch.Tensor = unpacked["x_v"]
         x_c: torch.Tensor = unpacked["x_c"]
         x_e: torch.Tensor = unpacked["x_e"]
         x_cc: torch.Tensor = unpacked["x_cc"]
-        edge_index: torch.Tensor = unpacked["edge_index"]
-        edge_relations: torch.Tensor = unpacked["edge_relations"]
+        edge_index: torch.Tensor = unpacked["edge_index"].to(dtype=torch.int32)
 
-        veh_corr_idx, out_corr_idx, out_turn_probs, is_exit_veh = _build_corridor_turn_tables(
+        veh_corr_idx, _, _, _ = _build_corridor_turn_tables(
             b_step, veh_ids, corridor_ids, topology
         )
-        free_eta = torch.tensor([b_step.vehicles[v].free_eta_s for v in veh_ids], dtype=torch.float32)
-        tail_score = torch.tensor([b_step.vehicles[v].tail_blockage_score for v in veh_ids], dtype=torch.float32)
-        v_norm = x_v[:, 3].clone()
-        obs_age = torch.tensor([b_step.vehicles[v].obs_age_s for v in veh_ids], dtype=torch.float32)
 
         serialized_steps.append(
             {
                 "sim_time": float(b_step.sim_time),
                 "veh_ids": veh_ids,
-                "veh_corridor_idx": veh_corr_idx,
-                "veh_out_corridor_idx": out_corr_idx,
-                "veh_out_turn_probs": out_turn_probs,
-                "veh_turn_src_idx": unpacked["veh_turn_src_idx"],
-                "veh_turn_out_corridor_idx": unpacked["veh_turn_out_corridor_idx"],
+                "veh_corridor_idx": veh_corr_idx.to(dtype=torch.int32),
+                "veh_turn_src_idx": unpacked["veh_turn_src_idx"].to(dtype=torch.int32),
+                "veh_turn_out_corridor_idx": unpacked["veh_turn_out_corridor_idx"].to(dtype=torch.int32),
                 "veh_turn_prob": unpacked["veh_turn_prob"],
-                "is_exit_fringe_veh": is_exit_veh,
-                "free_eta_s": free_eta,
-                "tail_blockage_score": tail_score,
                 "topo_precedence": unpacked["topo_precedence"],
                 "speed_evidence_pos": unpacked["speed_evidence_pos"],
-                "v_norm": v_norm,
-                "obs_age_s": obs_age,
                 "x_veh": x_v,
                 "x_corridor": x_c,
                 "x_edge": x_e,
                 "x_corridor_edge": x_cc,
-                "X_V": x_v,
-                "X_C": x_c,
                 "edge_index": edge_index,
-                "edge_relations": edge_relations,
-                "p_conflict": unpacked["p_conflict"],
-                "p_merge": unpacked["p_merge"],
                 "signed_path_gap_m": unpacked["signed_path_gap_m"],
-                "X_E": x_e,
-                "X_CC": x_cc,
                 "y_delay": torch.from_numpy(lbl.y_delay),
                 "tau_delay_s": torch.from_numpy(lbl.tau_delay_s),
                 "y_spillback": torch.from_numpy(lbl.y_spillback),
                 "y_edge": torch.from_numpy(lbl.y_edge),
-                "rank_pairs": torch.from_numpy(lbl.rank_pairs),
+                "rank_pairs": torch.from_numpy(lbl.rank_pairs).to(dtype=torch.int32),
             }
         )
 
@@ -777,6 +826,8 @@ def _rollout_worker_task(
     split: RolloutSplit,
     output_dir_str: str,
     behavior_policy_override: str | None,
+    max_windows_per_episode: int | None,
+    window_len_steps: int,
 ) -> dict[str, Any]:
     out_dir = Path(output_dir_str)
 
@@ -788,6 +839,8 @@ def _rollout_worker_task(
             split=split,
             output_dir=out_dir,
             behavior_policy_override=behavior_policy_override,
+            max_windows_per_episode=max_windows_per_episode,
+            window_len_steps=window_len_steps,
         )
 
     return _exec()
@@ -802,6 +855,8 @@ def collect_rollout_dataset(
     dbn_cfg: DBNConfig = DBNConfig(),
     max_workers: int = 4,
     behavior_policy_override: str | None = None,
+    max_windows_per_episode: int | None = None,
+    window_len_steps: int = 16,
     adapter_factory: Callable[..., Any] | None = None,
     tracker_factory: Callable[..., Any] | None = None,
     controller_factory: Callable[..., Any] | None = None,
@@ -848,6 +903,8 @@ def collect_rollout_dataset(
                 split=split,
                 output_dir=out_dir,
                 behavior_policy_override=behavior_policy_override,
+                max_windows_per_episode=max_windows_per_episode,
+                window_len_steps=window_len_steps,
                 adapter_factory=adapter_factory,
                 tracker_factory=tracker_factory,
                 controller_factory=controller_factory,
@@ -874,6 +931,8 @@ def collect_rollout_dataset(
                     split,
                     str(out_dir),
                     behavior_policy_override,
+                    max_windows_per_episode,
+                    window_len_steps,
                 ): (exp_cfg.scenario.scenario_id, seed)
                 for exp_cfg, seed in tasks
             }
@@ -949,7 +1008,7 @@ def load_rollout_shards(
             "Corrupted/leaked val manifest contains non-VAL_SEEDS!",
             context={"seeds": seeds},
         )
-    if actual_split in ("eval_id", "eval_ood") and (set(seeds) - set(TEST_SEEDS)):
+    if actual_split in ("eval_id", "eval_ood", "test") and (set(seeds) - set(TEST_SEEDS)):
         raise ConfigValidationError(
             "Corrupted/leaked held-out eval manifest contains non-TEST_SEEDS!",
             context={"seeds": seeds},

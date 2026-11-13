@@ -1653,3 +1653,134 @@ def test_live_sumo_collect_train_and_simulate_smoke(tmp_path: Path, monkeypatch:
     assert metrics.checkpoint_sha256 is not None
     assert trace_payload is not None and trace_file.is_file()
     assert len(trace_payload["frames"]) == short_scen.total_steps
+
+
+def test_test_split_named_splits_and_contiguous_window_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify split='test' anti-leakage, CLI --named-split predictive eval, and non-crossing contiguous windows."""
+    from swarm.cli import main as cli_main
+    from swarm.pipelines.rollout_collector import (
+        _select_contiguous_window_indices,
+        load_rollout_shards,
+        validate_rollout_split,
+    )
+    from swarm.pipelines.trainer import RolloutSequenceDataset
+
+    monkeypatch.setenv("MPLCONFIGDIR", str(tmp_path / ".mpl_cache"))
+
+    id_scen = ScenarioConfig(
+        scenario_id="grid3x3_nominal",
+        network_id="grid3x3",
+        net_xml_path="configs/networks/grid3x3.net.xml",
+        is_ood_regime=False,
+    )
+    ood_scen = ScenarioConfig(
+        scenario_id="osm_palo_alto_rush",
+        network_id="palo_alto_clean",
+        net_xml_path="configs/networks/palo_alto_clean.net.xml",
+        is_ood_regime=True,
+    )
+
+    # split='test' allows TEST_SEEDS across both ID and OOD, but blocks TRAIN_SEEDS and VAL_SEEDS
+    assert validate_rollout_split(id_scen, [TEST_SEEDS[0]], "test") == (TEST_SEEDS[0],)
+    assert validate_rollout_split(ood_scen, [TEST_SEEDS[1]], "test") == (TEST_SEEDS[1],)
+    with pytest.raises(ConfigValidationError):
+        validate_rollout_split(id_scen, [TRAIN_SEEDS[0]], "test")
+    with pytest.raises(ConfigValidationError):
+        validate_rollout_split(ood_scen, [VAL_SEEDS[0]], "test")
+
+    # Contiguous window selector produces non-overlapping windows inside [0, n_active - horizon_steps)
+    sel = _select_contiguous_window_indices(
+        200, max_windows_per_episode=3, window_len_steps=8, horizon_steps=20
+    )
+    assert len(sel) == 24
+    assert max(sel) < 180
+
+    # Train a quick ci_micro model and test CLI --named-split across 3 held-out splits,
+    # while blocking train/val manifests from eval-predictive!
+    tr_dir = _write_synthetic_rollout_split(
+        tmp_path / "tr", split="train", scenario_id="grid3x3_nominal", network_id="grid3x3", seeds=[TRAIN_SEEDS[0]], n_steps=8
+    )
+    va_dir = _write_synthetic_rollout_split(
+        tmp_path / "va", split="val", scenario_id="grid3x3_nominal", network_id="grid3x3", seeds=[VAL_SEEDS[0]], n_steps=8
+    )
+    t_id = _write_synthetic_rollout_split(
+        tmp_path / "t_id", split="test", scenario_id="grid3x3_nominal", network_id="grid3x3", seeds=[TEST_SEEDS[0]], n_steps=8
+    )
+    t_g4 = _write_synthetic_rollout_split(
+        tmp_path / "t_g4", split="test", scenario_id="grid4x4_incident", network_id="grid4x4", seeds=[TEST_SEEDS[1]], n_steps=8
+    )
+    t_pa = _write_synthetic_rollout_split(
+        tmp_path / "t_pa", split="test", scenario_id="osm_palo_alto_rush", network_id="palo_alto_clean", seeds=[TEST_SEEDS[2]], n_steps=8
+    )
+
+    # Verify trainer rejects split='test' in train_dir or val_dir
+    with pytest.raises(ConfigValidationError):
+        train_neural_dbn(
+            train_dir=t_id,
+            val_dir=va_dir,
+            output_checkpoint_path=tmp_path / "bad_ckpt.pt",
+            train_cfg=TrainConfig(model_preset="ci_micro", epochs=1),
+            dbn_cfg=DBNConfig(model_preset="ci_micro"),
+        )
+
+    ckpt_path = tmp_path / "ok_ckpt" / "neural_dbn.pt"
+    train_neural_dbn(
+        train_dir=tr_dir,
+        val_dir=va_dir,
+        output_checkpoint_path=ckpt_path,
+        train_cfg=TrainConfig(model_preset="ci_micro", epochs=2, batch_size=2, seed=7),
+        dbn_cfg=DBNConfig(model_preset="ci_micro"),
+    )
+
+    # Verify RolloutSequenceDataset never constructs windows crossing non-contiguous sim_time jumps
+    _, raw_shards = load_rollout_shards(t_id, expected_split="test")
+    gapped_shard = dict(raw_shards[0])
+    gapped_steps = [dict(s) for s in gapped_shard["steps"]]
+    for k in range(4, len(gapped_steps)):
+        gapped_steps[k]["sim_time"] = float(gapped_steps[k]["sim_time"]) + 25.0
+    gapped_shard["steps"] = gapped_steps
+    gapped_ds = RolloutSequenceDataset([gapped_shard], dbn_cfg=DBNConfig(model_preset="ci_micro"), window_len=4, stride=2)
+    for w_idx in range(len(gapped_ds)):
+        win = gapped_ds.get_window(w_idx)
+        times = [fb.sim_time for fb, _ in win]
+        diffs = [times[i + 1] - times[i] for i in range(len(times) - 1)]
+        assert all(d <= 1.0 for d in diffs)
+
+    pred_out = tmp_path / "multi_pred.json"
+    plot_out = tmp_path / "multi_pred.png"
+    rc = cli_main(
+        [
+            "--error-report-dir",
+            str(tmp_path / "err"),
+            "eval-predictive",
+            "--checkpoint",
+            str(ckpt_path),
+            "--named-split",
+            f"test_id_grid3x3={t_id}",
+            f"test_ood_grid4x4_incident={t_g4}",
+            f"test_ood_palo_alto={t_pa}",
+            "--output",
+            str(pred_out),
+            "--plot-output",
+            str(plot_out),
+            "--allow-ci-micro",
+        ]
+    )
+    assert rc == 0
+    pred_json = json.loads(pred_out.read_text(encoding="utf-8"))
+    assert set(pred_json["splits"]) == {
+        "test_id_grid3x3",
+        "test_ood_grid4x4_incident",
+        "test_ood_palo_alto",
+    }
+    assert plot_out.is_file()
+
+    # Passing a train split into --named-split must fail loudly
+    with pytest.raises(ConfigValidationError):
+        evaluate_heldout_predictive(
+            checkpoint_path=ckpt_path,
+            dataset_dirs={"leaked": tr_dir},
+            allow_ci_micro=True,
+        )

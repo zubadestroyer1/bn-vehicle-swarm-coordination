@@ -343,15 +343,29 @@ class RolloutSequenceDataset:
             self.episodes.append(ep_items)
 
             ep_len = len(ep_items)
-            if ep_len <= window_len:
-                self.windows.append((ep_idx, 0, ep_len))
-            else:
-                starts = list(range(0, ep_len - window_len + 1, stride))
-                last_start = ep_len - window_len
-                if starts[-1] != last_start:
-                    starts.append(last_start)
-                for st in starts:
-                    self.windows.append((ep_idx, st, st + window_len))
+            seg_starts = [0]
+            for k in range(1, ep_len):
+                fb_prev = ep_items[k - 1][0]
+                fb_cur = ep_items[k][0]
+                if (fb_cur.sim_time - fb_prev.sim_time) > (1.5 * max(fb_cur.dt, 0.05) + 1e-6):
+                    seg_starts.append(k)
+            seg_starts.append(ep_len)
+
+            for seg_i in range(len(seg_starts) - 1):
+                s0 = seg_starts[seg_i]
+                s1 = seg_starts[seg_i + 1]
+                seg_len = s1 - s0
+                if seg_len <= 0:
+                    continue
+                if seg_len <= window_len:
+                    self.windows.append((ep_idx, s0, s1))
+                else:
+                    starts = list(range(s0, s1 - window_len + 1, stride))
+                    last_start = s1 - window_len
+                    if starts[-1] != last_start:
+                        starts.append(last_start)
+                    for st in starts:
+                        self.windows.append((ep_idx, st, st + window_len))
 
     def __len__(self) -> int:
         return len(self.windows)
@@ -585,8 +599,16 @@ def _evaluate_validation_episodes(
             prev_delay: dict[str, Tensor] | None = None
             prev_omega: dict[tuple[str, str], Tensor] | None = None
             prev_omega_det: dict[tuple[str, str], Tensor] | None = None
+            prev_sim_time: float | None = None
 
             for fb, lbls in episode:
+                if prev_sim_time is not None and (fb.sim_time - prev_sim_time) > (1.5 * max(fb.dt, 0.05) + 1e-6):
+                    prev_mem = None
+                    prev_delay = None
+                    prev_omega = None
+                    prev_omega_det = None
+                prev_sim_time = float(fb.sim_time)
+
                 step_out = forward_dbn_step(
                     model=raw_model,
                     normalizer=normalizer,
@@ -1265,12 +1287,19 @@ def evaluate_heldout_predictive(
     for split_label, split_dir in split_map.items():
         expected_split: RolloutSplit | None = (
             split_label  # type: ignore[assignment]
-            if split_label in ("train", "val", "eval_id", "eval_ood")
+            if split_label in ("train", "val", "eval_id", "eval_ood", "test")
             else None
         )
-        _, shards = load_rollout_shards(split_dir, expected_split=expected_split)
+        manifest, shards = load_rollout_shards(split_dir, expected_split=expected_split)
         shard_seeds = {int(s["seed"]) for s in shards}
         if require_test_seeds:
+            actual_split = manifest.get("split")
+            if actual_split in ("train", "val"):
+                raise ConfigValidationError(
+                    f"Held-out predictive anti-leakage guard: split {split_label!r} loaded manifest "
+                    f"with split={actual_split!r} (only 'eval_id', 'eval_ood', or 'test' allowed).",
+                    context={"split": split_label, "manifest_split": actual_split},
+                )
             illegal = sorted(shard_seeds - set(TEST_SEEDS))
             if illegal:
                 raise ConfigValidationError(

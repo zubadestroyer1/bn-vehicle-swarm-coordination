@@ -159,7 +159,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_col.add_argument(
         "--split",
         required=True,
-        choices=("train", "val", "eval_id", "eval_ood"),
+        choices=("train", "val", "eval_id", "eval_ood", "test"),
         help="Dataset split (strictly enforces seed & ID/OOD topology separation).",
     )
     p_col.add_argument("--output-dir", type=Path, required=True, help="Output shard directory.")
@@ -167,6 +167,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_col.add_argument("--workers", type=int, default=4, help="Parallel rollout worker processes.")
     p_col.add_argument("--backend", choices=("libsumo", "traci"), default=None, help="SUMO backend override.")
     p_col.add_argument("--behavior-policy", default=None, help="Optional single behavior policy override.")
+    p_col.add_argument(
+        "--max-windows-per-episode",
+        type=int,
+        default=None,
+        help="Optional cap of evenly spaced contiguous trajectory windows recorded per episode.",
+    )
+    p_col.add_argument(
+        "--window-len-steps",
+        type=int,
+        default=16,
+        help="Contiguous step count per recorded trajectory window when --max-windows-per-episode is set.",
+    )
 
     # 3. train
     p_trn = sub.add_parser(
@@ -208,6 +220,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_pred.add_argument("--eval-id-dir", type=Path, default=None, help="Held-out ID rollout shard directory.")
     p_pred.add_argument("--eval-ood-dir", type=Path, default=None, help="Zero-shot OOD rollout shard directory.")
     p_pred.add_argument("--dataset-dir", type=Path, default=None, help="Single held-out rollout directory.")
+    p_pred.add_argument(
+        "--named-split",
+        nargs="*",
+        default=None,
+        help="Named held-out splits as NAME=DIR pairs (e.g. id_grid3x3=... ood_grid4x4=... ood_palo_alto=...).",
+    )
     p_pred.add_argument("--output", type=Path, required=True, help="Output predictive report JSON path.")
     p_pred.add_argument("--plot-output", type=Path, default=None, help="Optional ROC/PR/ECE figure PNG path.")
     p_pred.add_argument("--device", choices=("cpu", "mps", "cuda"), default="cpu", help="Inference device.")
@@ -385,6 +403,8 @@ def _cmd_collect(args: argparse.Namespace) -> int:
         dbn_cfg=DBNConfig(),
         max_workers=args.workers,
         behavior_policy_override=args.behavior_policy,
+        max_windows_per_episode=args.max_windows_per_episode,
+        window_len_steps=args.window_len_steps,
     )
     _LOG.info(
         "Collected %d %s rollout shards into %s",
@@ -436,9 +456,22 @@ def _cmd_eval_predictive(args: argparse.Namespace) -> int:
         dataset_dirs["eval_ood"] = args.eval_ood_dir
     if args.dataset_dir is not None:
         dataset_dirs["held_out"] = args.dataset_dir
+    if args.named_split:
+        for pair in args.named_split:
+            if "=" not in pair:
+                raise ConfigValidationError(
+                    f"Invalid --named-split entry {pair!r}; expected NAME=DIR."
+                )
+            label, raw_dir = pair.split("=", 1)
+            label = label.strip()
+            if not label or not raw_dir.strip():
+                raise ConfigValidationError(
+                    f"Invalid --named-split entry {pair!r}; expected non-empty NAME=DIR."
+                )
+            dataset_dirs[label] = Path(raw_dir.strip())
     if not dataset_dirs:
         raise ConfigValidationError(
-            "eval-predictive requires at least one of --eval-id-dir, --eval-ood-dir, or --dataset-dir."
+            "eval-predictive requires at least one of --eval-id-dir, --eval-ood-dir, --dataset-dir, or --named-split."
         )
 
     dbn_cfg = DBNConfig(inference_device=args.device)
