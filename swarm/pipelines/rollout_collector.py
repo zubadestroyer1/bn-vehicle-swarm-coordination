@@ -843,7 +843,22 @@ def _rollout_worker_task(
             window_len_steps=window_len_steps,
         )
 
-    return _exec()
+    try:
+        return _exec()
+    except Exception as exc:
+        get_logger("pipelines.rollout").error(
+            "Rollout subprocess failed on %s seed=%d: %s: %s",
+            exp_cfg.scenario.scenario_id,
+            seed,
+            type(exc).__name__,
+            exc,
+        )
+        # Convert any SWIG/C++ exception (e.g. libsumo.FatalTraCIError) into a pure-Python
+        # EpisodeExecutionError so ProcessPoolExecutor IPC queues never fail on SwigPyObject pickling.
+        raise EpisodeExecutionError(
+            f"{type(exc).__name__}: {exc}",
+            context={"scenario_id": exp_cfg.scenario.scenario_id, "seed": seed, "split": split},
+        ) from None
 
 
 def collect_rollout_dataset(
