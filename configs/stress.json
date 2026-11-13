@@ -1,0 +1,10 @@
+{
+  "duration": 240.0,
+  "arrival_rate": 0.8,
+  "position_noise": 3.5,
+  "velocity_noise": 1.2,
+  "sensor_dropout": 0.35,
+  "message_dropout": 0.40,
+  "max_message_delay": 6,
+  "communication_budget": 2
+}

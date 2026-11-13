@@ -1,0 +1,72 @@
+{
+  "seed": 7,
+  "history_window": 48,
+  "max_parents": 3,
+  "note": "Warmed structure-update timings on synthetic snapshots; methods use different learning objectives; neural training cost excluded; pair scoring remains O(n^2)",
+  "rows": [
+    {
+      "vehicles": 8,
+      "method": "neural",
+      "median_ms": 0.10610406752675772,
+      "p95_ms": 0.1779293408617377,
+      "repeats": 8,
+      "edges": 12
+    },
+    {
+      "vehicles": 8,
+      "method": "greedy",
+      "median_ms": 0.7407499942928553,
+      "p95_ms": 0.818714639171958,
+      "repeats": 8,
+      "edges": 7
+    },
+    {
+      "vehicles": 16,
+      "method": "neural",
+      "median_ms": 0.1566455466672778,
+      "p95_ms": 0.413599924650043,
+      "repeats": 8,
+      "edges": 38
+    },
+    {
+      "vehicles": 16,
+      "method": "greedy",
+      "median_ms": 3.013000125065446,
+      "p95_ms": 3.4000630024820566,
+      "repeats": 8,
+      "edges": 15
+    },
+    {
+      "vehicles": 32,
+      "method": "neural",
+      "median_ms": 0.248458469286561,
+      "p95_ms": 0.28467520605772734,
+      "repeats": 8,
+      "edges": 88
+    },
+    {
+      "vehicles": 32,
+      "method": "greedy",
+      "median_ms": 14.070583507418633,
+      "p95_ms": 14.63681299937889,
+      "repeats": 8,
+      "edges": 35
+    },
+    {
+      "vehicles": 64,
+      "method": "neural",
+      "median_ms": 0.6285619456321001,
+      "p95_ms": 0.646694318857044,
+      "repeats": 8,
+      "edges": 185
+    },
+    {
+      "vehicles": 64,
+      "method": "greedy",
+      "median_ms": 57.58202087599784,
+      "p95_ms": 60.4341562720947,
+      "repeats": 8,
+      "edges": 68
+    }
+  ]
+}

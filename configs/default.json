@@ -1,0 +1,11 @@
+{
+  "duration": 180.0,
+  "dt": 0.25,
+  "arrival_rate": 0.45,
+  "sensor_dropout": 0.10,
+  "message_dropout": 0.15,
+  "max_message_delay": 3,
+  "communication_budget": 4,
+  "risk_threshold": 0.10,
+  "inference_particles": 128
+}

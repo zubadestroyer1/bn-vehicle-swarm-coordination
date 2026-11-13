@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Swarm / Intersection replay</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,-apple-system,sans-serif;background:#0c151b;color:#e9f3f5}*{box-sizing:border-box}body{margin:0}main{max-width:1240px;margin:auto;padding:32px}header{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin-bottom:24px}.eyebrow{font-size:12px;letter-spacing:.18em;color:#67d7bb;text-transform:uppercase}h1{font-size:32px;font-weight:600;letter-spacing:-.04em;margin:8px 0}p{color:#9db1bb;font-size:14px;line-height:1.6;margin:0}.badge{border:1px solid #304550;border-radius:30px;padding:8px 14px;color:#b9d0d9;font-size:12px;white-space:nowrap}.layout{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:20px}.stage{border:1px solid #263b45;border-radius:16px;overflow:hidden;background:#101f27}canvas{width:100%;display:block;aspect-ratio:1/1}.controls{border-top:1px solid #263b45;padding:16px;display:flex;gap:14px;align-items:center;flex-wrap:wrap}button,select{background:#1b343e;border:1px solid #39545f;color:#e9f3f5;border-radius:8px;padding:8px 12px;font:inherit;font-size:13px;cursor:pointer}button:hover{background:#2b4d58}button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid #67d7bb;outline-offset:3px}input[type=range]{flex:1;min-width:100px;accent-color:#67d7bb}label{font-size:12px;color:#b4c8d0;display:flex;gap:6px;align-items:center}.panel{border:1px solid #263b45;border-radius:16px;padding:20px;margin-bottom:16px}h2{font-size:12px;letter-spacing:.1em;color:#9db1bb;text-transform:uppercase;margin:0 0 16px}.metric{display:flex;justify-content:space-between;align-items:baseline;padding:11px 0;border-bottom:1px solid #21353e}.metric:last-child{border:0}.metric span{font-size:12px;color:#a6bbc4}.metric strong{font-size:23px;font-weight:500;font-variant-numeric:tabular-nums}.legend{font-size:12px;color:#b4c8d0;display:flex;align-items:center;gap:9px;margin:12px 0}.dot{width:9px;height:9px;border-radius:50%;display:inline-block}footer{margin-top:20px;font-size:12px;color:#849ca6;line-height:1.7}.note{font-size:12px}.key{font-family:ui-monospace,monospace;color:#c0d4dc}@media(max-width:800px){main{padding:18px}.layout{grid-template-columns:1fr}aside{display:grid;grid-template-columns:1fr 1fr;gap:12px}.panel{margin:0;padding:14px}h1{font-size:27px}header{align-items:flex-start}.badge{display:none}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
+</style>
+</head>
+<body><main>
+<header><div><div class="eyebrow">CS 238 / Research prototype</div><h1>Vehicles in coordination.</h1><p>A replay of decisions, movement, and changing probabilistic dependencies.</p></div><div class="badge" id="run-label"></div></header>
+<div class="layout"><section class="stage" aria-label="Intersection simulation">
+<canvas id="view" width="1000" height="1000" aria-label="Four-way intersection with colored vehicles and inferred dependency edges"></canvas>
+<div class="controls"><button id="play" aria-label="Play simulation">Play</button><input id="time" aria-label="Simulation time" type="range" min="0" value="0" step="1"><select id="speed" aria-label="Playback speed"><option value="1">1× speed</option><option value="2" selected>2× speed</option><option value="4">4× speed</option><option value="8">8× speed</option></select><label><input id="edges" type="checkbox" checked>Dependencies</label></div>
+</section><aside>
+<div class="panel"><h2>Live state</h2><div class="metric"><span>Time</span><strong id="clock"></strong></div><div class="metric"><span>On the road</span><strong id="active"></strong></div><div class="metric"><span>Completed trips</span><strong id="completed"></strong></div><div class="metric"><span>Waiting upstream</span><strong id="queued"></strong></div><div class="metric"><span>Inferred edges</span><strong id="edge-count"></strong></div></div>
+<div class="panel"><h2>Reading the replay</h2><div class="legend"><i class="dot" style="background:#67d7bb"></i>North approach</div><div class="legend"><i class="dot" style="background:#e6b86d"></i>East approach</div><div class="legend"><i class="dot" style="background:#8ca8f0"></i>South approach</div><div class="legend"><i class="dot" style="background:#dc94bf"></i>West approach</div><p class="note">White rings mark active crossing reservations. Directed lines show Bayesian-network edges with probability ≥ 0.30; opacity indicates confidence.</p></div>
+<div class="panel"><h2>Full episode</h2><p class="note" id="episode"></p></div>
+</aside></div>
+<footer>Replay uses recorded ground-truth positions for display. The controller receives noisy beliefs. Every policy shares a conservative safety shield with access to true occupancy; this visualization is a simulation, not evidence of road-ready autonomy. <span class="key">Space</span> plays or pauses; <span class="key">← →</span> steps through frames.</footer>
+</main>
+<script id="trace" type="application/json">__TRACE_DATA__</script>
+<script>
+const data=JSON.parse(document.getElementById('trace').textContent), frames=data.frames;
+const canvas=document.getElementById('view'),ctx=canvas.getContext('2d'),slider=document.getElementById('time'),play=document.getElementById('play');
+const colors=['#67d7bb','#e6b86d','#8ca8f0','#dc94bf'];
+let index=0,running=false,last=0,carry=0;
+slider.max=Math.max(0,frames.length-1);
+document.getElementById('run-label').textContent=`${data.policy.toUpperCase()} · SEED ${data.seed}`;
+const m=data.metrics;
+document.getElementById('episode').textContent=`${m.completed} of ${m.arrived} arrivals completed. ${m.mean_accrued_delay_s.toFixed(1)} s accrued delay per arrival. ${m.collision_pairs} collision pairs; ${m.shield_interventions} stop-line safety interventions.`;
+function draw(){
+ if(!frames.length)return;
+ const frame=frames[index],w=canvas.width,extent=data.config.approach_length+12,scale=w/(extent*2),center=w/2;
+ const xy=(x,y)=>[center+x*scale,center-y*scale];
+ ctx.clearRect(0,0,w,w);ctx.fillStyle='#101f27';ctx.fillRect(0,0,w,w);
+ ctx.strokeStyle='#18303a';ctx.lineWidth=1;
+ for(let n=-80;n<=80;n+=10){let a=xy(n,-extent),b=xy(n,extent);ctx.beginPath();ctx.moveTo(...a);ctx.lineTo(...b);ctx.stroke();a=xy(-extent,n);b=xy(extent,n);ctx.beginPath();ctx.moveTo(...a);ctx.lineTo(...b);ctx.stroke()}
+ ctx.fillStyle='#233740';ctx.fillRect(center-9*scale,0,18*scale,w);ctx.fillRect(0,center-9*scale,w,18*scale);
+ ctx.fillStyle='#29424b';ctx.fillRect(center-9*scale,center-9*scale,18*scale,18*scale);
+ ctx.setLineDash([8,10]);ctx.strokeStyle='#75878b';ctx.lineWidth=1.5;
+ for(const angle of [0,Math.PI/2,Math.PI,3*Math.PI/2]){ctx.save();ctx.translate(center,center);ctx.rotate(angle);ctx.beginPath();ctx.moveTo(0,12*scale);ctx.lineTo(0,w/2);ctx.stroke();ctx.restore()}
+ ctx.setLineDash([]);ctx.strokeStyle='#c6d6d7';ctx.lineWidth=3;
+ for(const angle of [0,Math.PI/2,Math.PI,3*Math.PI/2]){ctx.save();ctx.translate(center,center);ctx.rotate(angle);ctx.beginPath();ctx.moveTo(-5*scale,-11*scale);ctx.lineTo(0,-11*scale);ctx.stroke();ctx.restore()}
+ ctx.fillStyle='#a6bec8';ctx.font='500 17px system-ui';ctx.textAlign='center';ctx.fillText('N',center-24,28);ctx.fillText('S',center+24,w-20);ctx.fillText('W',25,center+30);ctx.fillText('E',w-25,center-22);
+ const vehicles=new Map(frame.vehicles.map(v=>[v.id,v]));
+ if(document.getElementById('edges').checked){for(const edge of frame.edges){const a=vehicles.get(edge.source),b=vehicles.get(edge.target);if(!a||!b)continue;const p=xy(a.x,a.y),q=xy(b.x,b.y);ctx.strokeStyle=`rgba(126,222,211,${.10+.45*edge.probability})`;ctx.lineWidth=1+edge.probability*1.8;ctx.beginPath();ctx.moveTo(...p);ctx.lineTo(...q);ctx.stroke();const angle=Math.atan2(q[1]-p[1],q[0]-p[0]),tip=[q[0]-Math.cos(angle)*12,q[1]-Math.sin(angle)*12];ctx.beginPath();ctx.moveTo(tip[0]-Math.cos(angle-.45)*8,tip[1]-Math.sin(angle-.45)*8);ctx.lineTo(...tip);ctx.lineTo(tip[0]-Math.cos(angle+.45)*8,tip[1]-Math.sin(angle+.45)*8);ctx.stroke()}}
+ for(const v of frame.vehicles){const [x,y]=xy(v.x,v.y),r=Math.max(5,data.config.vehicle_radius*scale);if(v.reserved){ctx.beginPath();ctx.arc(x,y,r+4,0,2*Math.PI);ctx.strokeStyle='#e5f2f2';ctx.lineWidth=1.5;ctx.stroke()}ctx.beginPath();ctx.arc(x,y,r,0,2*Math.PI);ctx.fillStyle=colors[v.lane];ctx.fill();ctx.fillStyle='#0b1e25';ctx.font='600 10px system-ui';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(String(v.id),x,y);ctx.textBaseline='alphabetic'}
+ slider.value=index;document.getElementById('clock').textContent=frame.time.toFixed(1)+' s';document.getElementById('active').textContent=frame.vehicles.length;document.getElementById('completed').textContent=frame.completed;document.getElementById('queued').textContent=frame.queued;document.getElementById('edge-count').textContent=frame.edges.length;
+}
+function setPlaying(value){running=value;play.textContent=running?'Pause':'Play';play.setAttribute('aria-label',running?'Pause simulation':'Play simulation');last=performance.now();carry=0}
+play.addEventListener('click',()=>{if(index===frames.length-1)index=0;setPlaying(!running);draw()});slider.addEventListener('input',()=>{index=Number(slider.value);carry=0;draw()});document.getElementById('edges').addEventListener('change',draw);
+document.addEventListener('keydown',event=>{if(['INPUT','SELECT','BUTTON'].includes(event.target.tagName))return;if(event.code==='Space'){event.preventDefault();setPlaying(!running)}if(event.key==='ArrowRight'||event.key==='ArrowLeft'){event.preventDefault();setPlaying(false);index=Math.max(0,Math.min(frames.length-1,index+(event.key==='ArrowRight'?1:-1)));draw()}});
+function animate(now){if(running&&frames.length>1){carry+=(now-last)/1000*Number(document.getElementById('speed').value);while(index<frames.length-1&&carry>=frames[index+1].time-frames[index].time){carry-=frames[index+1].time-frames[index].time;index++;draw()}if(index===frames.length-1)setPlaying(false)}last=now;requestAnimationFrame(animate)}draw();requestAnimationFrame(animate);
+</script></body></html>

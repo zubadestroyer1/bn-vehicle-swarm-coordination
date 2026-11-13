@@ -1,0 +1,29 @@
+{
+  "python": "3.12.14 (main, Aug 25 2026, 13:50:33) [Clang 22.1.3 ]",
+  "platform": "macOS-26.6-arm64-arm-64bit",
+  "packages": {
+    "numpy": "2.5.4",
+    "matplotlib": "3.11.2",
+    "pillow": "13.0.0"
+  },
+  "model_sha256": "d31e2b2944748a61ae45ab1095805427c850b8a84718b4f1f2d42b3f4c4f5c7d",
+  "source_sha256": {
+    "swarm/__init__.py": "77c687df0715b756009dd50a3481c1c39e0a8690ad1c37ec9027a3ba0e3f9674",
+    "swarm/__main__.py": "6d8b7d7846a845059d7a3107143f11131f63c5511d669b44085b15ec5e3d2279",
+    "swarm/bayes.py": "b1f46a76b947f2ea2486eae12c0331191231e238a3d671c250d0dd5b681a1df1",
+    "swarm/belief.py": "d0690bc62fe1c584b1b58b0c17c57ce5d66380b935a45fa78416d414ed01dd6c",
+    "swarm/cli.py": "b4a9b26c19a6844a797788092aeb00b7eb7c18572c2deb248caf694f76aeb096",
+    "swarm/config.py": "c1c74c57e5b168b9bd764ec55b5f5c12c385e5c4c9ac5c3519dae33840efec6b",
+    "swarm/experiment.py": "665dca092655aa57ea89b2a692441b7b7bfe4be4cc76c6cad6ab52d293a76f80",
+    "swarm/features.py": "7b66fd5c80f677ea2ca8c4c81ea0df8c4ab225a575581de848fe9c9299b411ad",
+    "swarm/geometry.py": "ba3350ea2891f6e3b347e38a34535064ef3d93006ad37ea42f5090f46a7d9165",
+    "swarm/neural.py": "c8b3e3aece9d82ad965b218216ee3877d563dadcd2bd4c72ef1dfc0ad6e62af5",
+    "swarm/policies.py": "0e9358606c1e1a9243c8ff4733f7364ea261daa9982fa4dd93751b2d3b2ad730",
+    "swarm/render.py": "3d3a1a0f26401ead70f4ce808270e9096ff94f6590b4213b00390ef2ffd64d96",
+    "swarm/replay.html": "1509edc8f6525e85f243202d4e1c3bacae8bc2b40a844fa8f9e836ee5485c3a6",
+    "swarm/simulator.py": "57bea1593026be7dfbb2f1afe33eb3112648a5daf0b0aa700b13af71d6c4b60a",
+    "swarm/training.py": "f1d02c6425426f5519169cc12f3885f0e0eef56f0127d2bd75822c14b2c667eb"
+  },
+  "date": "2026-11-12",
+  "note": "Controller/environment code matches the run; subsequent changes affect ECE bin boundary handling, configuration error messages, and static preview export only."
+}
