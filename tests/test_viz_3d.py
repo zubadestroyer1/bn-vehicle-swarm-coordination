@@ -14,6 +14,8 @@ Verifies:
 from __future__ import annotations
 
 import ast
+import base64
+import gzip
 import json
 import math
 import os
@@ -58,9 +60,12 @@ from swarm.logging_utils import (  # noqa: E402
 )
 from swarm.viz import (  # noqa: E402
     EpisodeTraceRecorder,
+    PAYLOAD_FORMAT_VERSION,
     SCENE_SCHEMA_VERSION,
+    decode_viewer_html_payload,
     export_scene_3d,
     load_trace_json,
+    pack_viewer_payload,
     plot_ablation_breakdown,
     plot_calibration_and_roc_pr,
     plot_latency_scaling,
@@ -68,6 +73,7 @@ from swarm.viz import (  # noqa: E402
     plot_scenario_comparison,
     render_publication_plots,
     triangulate_polygon_2d,
+    unpack_viewer_payload,
     write_city_3d_viewer,
 )
 
@@ -598,9 +604,10 @@ def test_episode_trace_recorder_protocol_and_invariants(tmp_path: Path) -> None:
 
 
 def test_write_city_3d_viewer_single_and_split_screen(tmp_path: Path) -> None:
-    """Verify self-contained 3D HTML viewer generation, JSON payload, and ``node --check`` JS syntax."""
+    """Verify compressed Gzip+SoA 3D HTML viewer generation, round-trip fidelity, minimalist HUD selectors, and ``node --check``."""
     topo = _build_synthetic_topology(tmp_path)
     scene = export_scene_3d(topo)
+    assert "focus_bounds" in scene
     primary_trace = _record_synthetic_trace(topo, "neural_dbn", speed_scale=1.0)
     baseline_trace = _record_synthetic_trace(topo, "actuated_signal", speed_scale=0.72)
 
@@ -612,44 +619,156 @@ def test_write_city_3d_viewer_single_and_split_screen(tmp_path: Path) -> None:
         comparison_trace=baseline_trace,
     )
 
+    required_selectors = (
+        'id="viewport-grid"',
+        'data-layout="split"',
+        'data-layout="primary"',
+        'data-layout="compare"',
+        'id="pane-primary"',
+        'id="canvas-primary"',
+        'id="pane-compare"',
+        'id="canvas-compare"',
+        'id="top-hud"',
+        'id="scenario-title"',
+        'id="layout-group"',
+        'id="camera-group"',
+        'data-cam="orbit"',
+        'data-cam="ortho"',
+        'data-cam="chase"',
+        'id="btn-export-png"',
+        'id="scorecard-primary"',
+        'id="scorecard-compare"',
+        'id="title-primary"',
+        'id="title-compare"',
+        'id="badge-delta"',
+        'id="kpi-p-delay"',
+        'id="kpi-p-throughput"',
+        'id="kpi-p-spill"',
+        'id="kpi-p-safety"',
+        'id="kpi-p-live"',
+        'id="kpi-c-delay"',
+        'id="kpi-c-throughput"',
+        'id="kpi-c-spill"',
+        'id="kpi-c-safety"',
+        'id="kpi-c-live"',
+        'id="vehicle-chip"',
+        'id="chip-id"',
+        'id="chip-mode"',
+        'id="chip-speed"',
+        'id="chip-delay"',
+        'id="chip-close"',
+        'id="playback-bar"',
+        'id="btn-play"',
+        'id="time-readout"',
+        'id="timeline-slider"',
+        'id="btn-speed"',
+        'id="toggle-arcs"',
+        'id="arcs-legend"',
+        'id="toggle-buildings"',
+        'id="loading-overlay"',
+        'id="loading-status"',
+        'id="error-banner"',
+        'id="error-message"',
+    )
+    removed_clutter = (
+        'id="side-drawer"',
+        'id="slider-omega"',
+        'id="sparkline-canvas"',
+    )
+
     for html_p, expect_compare in ((single_html_path, False), (split_html_path, True)):
         assert html_p.is_file() and html_p.stat().st_size > 40_000
         text = html_p.read_text(encoding="utf-8")
         assert re.findall(r"https?://", text, flags=re.IGNORECASE) == []
-        assert 'data-cam="orbit"' in text
-        assert 'data-cam="ortho"' in text
-        assert 'data-cam="chase"' in text
-        assert 'id="pane-compare"' in text
-        assert 'id="canvas-compare"' in text
-        assert 'data-layout="split"' in text
-        assert 'id="btn-export-png"' in text
+        for sel in required_selectors:
+            assert sel in text, f"Missing required minimalist UI selector {sel!r} in {html_p.name}"
+        for old_sel in removed_clutter:
+            assert old_sel not in text, f"Legacy clutter selector {old_sel!r} still present in {html_p.name}"
 
-        m_payload = re.search(
-            r'<script id="swarm-payload" type="application/json">\s*(.*?)\s*</script>',
+        # Verify metadata script block
+        m_meta = re.search(
+            r'<script id="swarm-payload-meta" type="application/json">\s*(.*?)\s*</script>',
             text,
             flags=re.DOTALL,
         )
-        assert m_payload is not None
-        parsed_payload = json.loads(m_payload.group(1))
-        assert parsed_payload["scene"]["network_id"] == "synthetic_grid2x2"
-        assert parsed_payload["primary_trace"]["policy_name"] == "neural_dbn"
-        if expect_compare:
-            assert parsed_payload["comparison_trace"]["policy_name"] == "actuated_signal"
-        else:
-            assert parsed_payload["comparison_trace"] is None
+        assert m_meta is not None
+        meta_obj = json.loads(m_meta.group(1))
+        assert meta_obj["format"] == PAYLOAD_FORMAT_VERSION
+        assert meta_obj["network_id"] == "synthetic_grid2x2"
+        assert meta_obj["primary_policy"] == "neural_dbn"
+        assert meta_obj["has_comparison"] is expect_compare
+        assert "focus_bounds" in meta_obj
+
+        # Verify direct Python base64 + gzip.decompress round-trip fidelity of <script id="swarm-payload-gz">
+        m_gz = re.search(
+            r'<script id="swarm-payload-gz" type="application/octet-stream">\s*(.*?)\s*</script>',
+            text,
+            flags=re.DOTALL,
+        )
+        assert m_gz is not None
+        raw_gz_bytes = base64.b64decode(m_gz.group(1).strip(), validate=True)
+        decompressed_json = gzip.decompress(raw_gz_bytes).decode("utf-8")
+        packed_payload = json.loads(decompressed_json)
+        assert packed_payload["format"] == PAYLOAD_FORMAT_VERSION
+        assert packed_payload["scene"]["network_id"] == "synthetic_grid2x2"
+        assert "focus_bounds" in packed_payload["scene"]
+
+        unpacked = unpack_viewer_payload(packed_payload)
+        decoded_direct = decode_viewer_html_payload(text)
+        for check_obj in (unpacked, decoded_direct):
+            assert check_obj["scene"]["network_id"] == "synthetic_grid2x2"
+            assert len(check_obj["scene"]["lanes"]) == len(scene["lanes"])
+            assert len(check_obj["scene"]["buildings"]) == len(scene["buildings"])
+            p_tr = check_obj["primary_trace"]
+            assert p_tr["policy_name"] == "neural_dbn"
+            assert p_tr["frame_count"] == 6
+            assert len(p_tr["frames"]) == 6
+            assert len(p_tr["frames"][0]["vehicles"]) == 3
+            assert len(p_tr["frames"][0]["dbn_edges"]) == 3
+            assert p_tr["frames"][0]["vehicles"][0]["id"] == "veh_0"
+            assert p_tr["frames"][0]["vehicles"][0]["x"] == pytest.approx(20.0, abs=0.02)
+            if expect_compare:
+                c_tr = check_obj["comparison_trace"]
+                assert c_tr is not None
+                assert c_tr["policy_name"] == "actuated_signal"
+                assert len(c_tr["frames"]) == 6
+            else:
+                assert check_obj["comparison_trace"] is None
+
+    # Also verify >20-frame large-trace pure SoA packing/unpacking & weak-edge pruning
+    large_frames = [
+        dict(primary_trace["frames"][k % 6], t=0.5 * k)
+        for k in range(25)
+    ]
+    large_frames[0] = dict(
+        large_frames[0],
+        dbn_edges=list(large_frames[0]["dbn_edges"])
+        + [{"src": "veh_1", "dst": "veh_0", "rel": 0, "omega": 0.04, "kappa": 0.02, "gamma": 0.01, "p_conf": 0.0}],
+    )
+    large_trace = dict(primary_trace, frame_count=25, frames=large_frames)
+    packed_large = pack_viewer_payload(scene, large_trace)
+    assert "frames" not in packed_large["primary_trace"]
+    assert packed_large["primary_trace"]["encoding"] == "soa_v2"
+    unpacked_large = unpack_viewer_payload(packed_large)["primary_trace"]
+    assert len(unpacked_large["frames"]) == 25
+    # Weak edge (omega=0.04 < 0.12) pruned cleanly while all 3 strong edges preserved
+    assert len(unpacked_large["frames"][0]["dbn_edges"]) == 3
+    assert unpacked_large["frames"][4]["vehicles"][0]["x"] == pytest.approx(
+        primary_trace["frames"][4]["vehicles"][0]["x"], abs=0.02
+    )
 
     # Validate embedded JS syntax using Node.js (`node --check`)
     node_bin = shutil.which("node") or (
         "/opt/homebrew/bin/node" if Path("/opt/homebrew/bin/node").is_file() else None
     )
-    if node_bin is not None:
-        split_txt = split_html_path.read_text(encoding="utf-8")
-        scripts = re.findall(r"<script>\s*(.*?)\s*</script>", split_txt, flags=re.DOTALL)
-        assert len(scripts) == 1
-        extracted_js = tmp_path / "embedded_viewer_bundle.js"
-        extracted_js.write_text(scripts[0], encoding="utf-8")
-        proc = subprocess.run([node_bin, "--check", str(extracted_js)], capture_output=True, text=True, check=False)
-        assert proc.returncode == 0, f"node --check failed:\n{proc.stderr}"
+    assert node_bin is not None, "node binary required for JS syntax verification"
+    split_txt = split_html_path.read_text(encoding="utf-8")
+    scripts = re.findall(r"<script>\s*(.*?)\s*</script>", split_txt, flags=re.DOTALL)
+    assert len(scripts) == 1
+    extracted_js = tmp_path / "embedded_viewer_bundle.js"
+    extracted_js.write_text(scripts[0], encoding="utf-8")
+    proc = subprocess.run([node_bin, "--check", str(extracted_js)], capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, f"node --check failed:\n{proc.stderr}"
 
     with pytest.raises(ConfigValidationError):
         write_city_3d_viewer(scene, {"frames": []}, tmp_path / "invalid.html")

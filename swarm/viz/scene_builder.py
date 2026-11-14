@@ -378,6 +378,8 @@ def _generate_procedural_city_blocks(
     junction_coords: Sequence[tuple[float, float]],
     road_segments: Sequence[tuple[float, float, float, float, float]],
     bbox: tuple[float, float, float, float],
+    *,
+    axis_coords: Sequence[tuple[float, float]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Synthesize setback-verified architectural 3D city blocks & green plazas for grid networks."""
     min_x, min_y, max_x, max_y = bbox
@@ -394,6 +396,8 @@ def _generate_procedural_city_blocks(
         [0.75, 0.80, 0.82],
     )
 
+    major_juncs = list(axis_coords) if axis_coords is not None and len(axis_coords) >= 4 else list(junction_coords)
+
     def _box_clear_of_roads(cx: float, cy: float, hw: float, hd: float, clearance_m: float) -> bool:
         test_pts = (
             (cx, cy),
@@ -405,21 +409,37 @@ def _generate_procedural_city_blocks(
             (cx + hw, cy),
             (cx, cy - hd),
             (cx, cy + hd),
+            (cx - hw, cy - 0.5 * hd),
+            (cx - hw, cy + 0.5 * hd),
+            (cx + hw, cy - 0.5 * hd),
+            (cx + hw, cy + 0.5 * hd),
+            (cx - 0.5 * hw, cy - hd),
+            (cx + 0.5 * hw, cy - hd),
+            (cx - 0.5 * hw, cy + hd),
+            (cx + 0.5 * hw, cy + hd),
         )
         for px, py in test_pts:
             for ax, ay, bx, by, half_w in road_segments:
                 thresh = half_w + clearance_m
                 if _point_to_segment_dist_sq(px, py, ax, ay, bx, by) < thresh * thresh:
                     return False
-            for jx, jy in junction_coords:
+            for jx, jy in major_juncs:
                 j_thresh = 16.0 + clearance_m * 0.5
                 if (px - jx) ** 2 + (py - jy) ** 2 < j_thresh * j_thresh:
                     return False
         return True
 
-    # Snap unique grid axes from interior junctions (works for 1x1, 3x3, 4x4, or general grids)
-    xs_sorted = sorted({round(c[0], 0) for c in junction_coords})
-    ys_sorted = sorted({round(c[1], 0) for c in junction_coords})
+    # Snap unique grid axes from major/signalized intersections + outer network boundary
+    # (prevents mid-corridor turn-pocket split nodes from slicing 150m blocks into narrow strips).
+    if axis_coords is not None and len(axis_coords) >= 4:
+        raw_xs = {round(c[0], 0) for c in axis_coords} | {round(min_x, 0), round(max_x, 0)}
+        raw_ys = {round(c[1], 0) for c in axis_coords} | {round(min_y, 0), round(max_y, 0)}
+    else:
+        raw_xs = {round(c[0], 0) for c in junction_coords}
+        raw_ys = {round(c[1], 0) for c in junction_coords}
+
+    xs_sorted = sorted(raw_xs)
+    ys_sorted = sorted(raw_ys)
 
     def _merge_close(vals: list[float], tol: float = 28.0) -> list[float]:
         merged: list[float] = []
@@ -445,7 +465,7 @@ def _generate_procedural_city_blocks(
                 if cell_w < 55.0 or cell_h < 55.0:
                     continue
 
-                setback = 18.5
+                setback = 21.5 if min(cell_w, cell_h) >= 110.0 else 18.5
                 bx0, bx1 = x0 + setback, x1 - setback
                 by0, by1 = y0 + setback, y1 - setback
                 if bx1 - bx0 < 18.0 or by1 - by0 < 18.0:
@@ -543,6 +563,161 @@ def _generate_procedural_city_blocks(
                         b_idx += 1
 
     return buildings, parks
+
+
+def synthesize_procedural_blocks_for_scene(
+    scene_data: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Regenerate procedural 3D city blocks & plazas from an exported scene dictionary."""
+    bounds = scene_data["bounds"]
+    bbox = (
+        float(bounds["min_x"]),
+        float(bounds["min_y"]),
+        float(bounds["max_x"]),
+        float(bounds["max_y"]),
+    )
+    junctions = scene_data.get("junctions") or ()
+    signals = scene_data.get("signals") or ()
+    lanes = scene_data.get("lanes") or ()
+
+    junction_coords: list[tuple[float, float]] = [
+        (float(j["coord_xy"][0]), float(j["coord_xy"][1]))
+        for j in junctions
+        if j.get("coord_xy") and len(j["coord_xy"]) >= 2
+    ]
+
+    tls_coords: list[tuple[float, float]] = [
+        (float(j["coord_xy"][0]), float(j["coord_xy"][1]))
+        for j in junctions
+        if "traffic_light" in str(j.get("node_type", "")).lower()
+        and j.get("coord_xy")
+        and len(j["coord_xy"]) >= 2
+    ]
+    if len(tls_coords) < 4:
+        for sig in signals:
+            links = sig.get("links") or ()
+            if links:
+                lx = sum(float(lk["head_xyz"][0]) for lk in links) / len(links)
+                ly = sum(float(lk["head_xyz"][1]) for lk in links) / len(links)
+                tls_coords.append((lx, ly))
+
+    road_segments: list[tuple[float, float, float, float, float]] = []
+    for ln in lanes:
+        pts = ln.get("shape") or ()
+        width = float(ln.get("width_m", 3.2))
+        half_w = max(3.5, width * 0.7)
+        for s_i in range(len(pts) - 1):
+            road_segments.append(
+                (
+                    float(pts[s_i][0]),
+                    float(pts[s_i][1]),
+                    float(pts[s_i + 1][0]),
+                    float(pts[s_i + 1][1]),
+                    half_w,
+                )
+            )
+
+    return _generate_procedural_city_blocks(
+        junction_coords=junction_coords,
+        road_segments=road_segments,
+        bbox=bbox,
+        axis_coords=tls_coords if len(tls_coords) >= 4 else None,
+    )
+
+
+def compute_scene_focus_bounds(
+    bounds: Mapping[str, Any],
+    junctions: Sequence[Mapping[str, Any]],
+    lanes: Sequence[Mapping[str, Any]] = (),
+    signals: Sequence[Mapping[str, Any]] = (),
+) -> dict[str, float]:
+    """Compute tight urban core framing bounds from signalized intersections or core road geometry.
+
+    Prevents distant highway approach ramps (such as perimeter arterial approaches in OpenStreetMap
+    Downtown Palo Alto) from skewing the initial 3D isometric camera away from the signalized grid.
+    """
+    min_x = float(bounds["min_x"])
+    min_y = float(bounds["min_y"])
+    max_x = float(bounds["max_x"])
+    max_y = float(bounds["max_y"])
+    require_finite(min_x, "bounds.min_x")
+    require_finite(min_y, "bounds.min_y")
+    require_finite(max_x, "bounds.max_x")
+    require_finite(max_y, "bounds.max_y")
+
+    tls_pts: list[tuple[float, float]] = []
+    for sig in signals:
+        links = sig.get("links") or ()
+        if links:
+            lx = sum(float(lk["head_xyz"][0]) for lk in links) / len(links)
+            ly = sum(float(lk["head_xyz"][1]) for lk in links) / len(links)
+            tls_pts.append((lx, ly))
+
+    if len(tls_pts) < 4:
+        for junc in junctions:
+            if "traffic_light" in str(junc.get("node_type", "")).lower():
+                coord = junc.get("coord_xy")
+                if coord and len(coord) >= 2:
+                    tls_pts.append((float(coord[0]), float(coord[1])))
+
+    if len(tls_pts) >= 18:
+        # Large OSM urban network with perimeter arterial signals: frame p10..p90 core tightly
+        xs = np.array([p[0] for p in tls_pts], dtype=np.float64)
+        ys = np.array([p[1] for p in tls_pts], dtype=np.float64)
+        fx0, fx1 = float(np.percentile(xs, 10.0)), float(np.percentile(xs, 90.0))
+        fy0, fy1 = float(np.percentile(ys, 10.0)), float(np.percentile(ys, 90.0))
+        pad_x = max(40.0, 0.08 * (fx1 - fx0))
+        pad_y = max(40.0, 0.08 * (fy1 - fy0))
+    elif len(tls_pts) >= 4:
+        xs = np.array([p[0] for p in tls_pts], dtype=np.float64)
+        ys = np.array([p[1] for p in tls_pts], dtype=np.float64)
+        fx0, fx1 = float(np.percentile(xs, 5.0)), float(np.percentile(xs, 95.0))
+        fy0, fy1 = float(np.percentile(ys, 5.0)), float(np.percentile(ys, 95.0))
+        pad_x = max(45.0, 0.12 * (fx1 - fx0))
+        pad_y = max(45.0, 0.12 * (fy1 - fy0))
+    else:
+        fallback_pts: list[tuple[float, float]] = [
+            (float(j["coord_xy"][0]), float(j["coord_xy"][1]))
+            for j in junctions
+            if j.get("coord_xy") and len(j["coord_xy"]) >= 2
+        ]
+        if not fallback_pts:
+            for ln in lanes:
+                for pt in ln.get("shape") or ():
+                    fallback_pts.append((float(pt[0]), float(pt[1])))
+        if len(fallback_pts) >= 4:
+            xs = np.array([p[0] for p in fallback_pts], dtype=np.float64)
+            ys = np.array([p[1] for p in fallback_pts], dtype=np.float64)
+            fx0, fx1 = float(np.percentile(xs, 5.0)), float(np.percentile(xs, 95.0))
+            fy0, fy1 = float(np.percentile(ys, 5.0)), float(np.percentile(ys, 95.0))
+            pad_x = max(30.0, 0.10 * (fx1 - fx0))
+            pad_y = max(30.0, 0.10 * (fy1 - fy0))
+        else:
+            fx0, fx1, fy0, fy1 = min_x, max_x, min_y, max_y
+            pad_x = 0.0
+            pad_y = 0.0
+
+    fx0 = max(min_x, fx0 - pad_x)
+    fx1 = min(max_x, fx1 + pad_x)
+    fy0 = max(min_y, fy0 - pad_y)
+    fy1 = min(max_y, fy1 + pad_y)
+    if fx1 - fx0 < 40.0:
+        cx = 0.5 * (fx0 + fx1)
+        fx0, fx1 = max(min_x, cx - 20.0), min(max_x, cx + 20.0)
+    if fy1 - fy0 < 40.0:
+        cy = 0.5 * (fy0 + fy1)
+        fy0, fy1 = max(min_y, cy - 20.0), min(max_y, cy + 20.0)
+
+    return {
+        "min_x": round(fx0, 3),
+        "min_y": round(fy0, 3),
+        "max_x": round(fx1, 3),
+        "max_y": round(fy1, 3),
+        "center_x": round(0.5 * (fx0 + fx1), 3),
+        "center_y": round(0.5 * (fy0 + fy1), 3),
+        "span_x": round(max(10.0, fx1 - fx0), 3),
+        "span_y": round(max(10.0, fy1 - fy0), 3),
+    }
 
 
 def export_scene_3d_from_files(
@@ -837,26 +1012,42 @@ def export_scene_3d_from_files(
     if poly_p is not None:
         buildings_out, parks_out = _extract_osm_polygons(poly_p, bbox=bbox)
     else:
+        tls_junction_coords = [
+            (float(j["coord_xy"][0]), float(j["coord_xy"][1]))
+            for j in junctions_out
+            if "traffic_light" in str(j.get("node_type", "")).lower()
+        ]
         buildings_out, parks_out = _generate_procedural_city_blocks(
             junction_coords=junction_coords,
             road_segments=road_segments,
             bbox=bbox,
+            axis_coords=tls_junction_coords if len(tls_junction_coords) >= 4 else None,
         )
+
+    full_bounds: dict[str, Any] = {
+        "min_x": round(min_x, 3),
+        "min_y": round(min_y, 3),
+        "max_x": round(max_x, 3),
+        "max_y": round(max_y, 3),
+        "center_x": round(0.5 * (min_x + max_x), 3),
+        "center_y": round(0.5 * (min_y + max_y), 3),
+        "span_x": round(max(10.0, max_x - min_x), 3),
+        "span_y": round(max(10.0, max_y - min_y), 3),
+    }
+    focus_bounds = compute_scene_focus_bounds(
+        bounds=full_bounds,
+        junctions=junctions_out,
+        lanes=lanes_out,
+        signals=signals_out,
+    )
+    full_bounds["focus_bounds"] = dict(focus_bounds)
 
     scene_dict: dict[str, Any] = {
         "schema_version": SCENE_SCHEMA_VERSION,
         "network_id": network_id,
         "source_mode": "osm_poly" if poly_p is not None else "procedural_blocks",
-        "bounds": {
-            "min_x": round(min_x, 3),
-            "min_y": round(min_y, 3),
-            "max_x": round(max_x, 3),
-            "max_y": round(max_y, 3),
-            "center_x": round(0.5 * (min_x + max_x), 3),
-            "center_y": round(0.5 * (min_y + max_y), 3),
-            "span_x": round(max(10.0, max_x - min_x), 3),
-            "span_y": round(max(10.0, max_y - min_y), 3),
-        },
+        "bounds": full_bounds,
+        "focus_bounds": focus_bounds,
         "lanes": lanes_out,
         "lane_dividers": lane_dividers_out,
         "stop_bars": stop_bars_out,
@@ -901,7 +1092,9 @@ def export_scene_3d(
 
 __all__ = [
     "SCENE_SCHEMA_VERSION",
+    "compute_scene_focus_bounds",
     "export_scene_3d",
     "export_scene_3d_from_files",
+    "synthesize_procedural_blocks_for_scene",
     "triangulate_polygon_2d",
 ]

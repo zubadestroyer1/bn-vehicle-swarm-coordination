@@ -1,0 +1,1093 @@
+{
+  "git_sha": "25e20ee0e3a6b89680002382ebf883d31a698c04",
+  "num_episodes": 90,
+  "policies": [
+    "actuated_signal",
+    "online_bic_dbn",
+    "neural_dbn"
+  ],
+  "primary_policy": "neural_dbn",
+  "provenance": {
+    "bootstrap_resamples": 10000,
+    "checkpoint_path": "models/sota_cloud_xl_gpu/neural_dbn.pt",
+    "checkpoint_sha256": "25235ea3d54784896928a9dc7592cca31a535f9d9c8b5f68ab290d6b77c1afb8",
+    "control_config_sha256": "c8afa1013c589b7773a5a5ed6c082ba0a36db01043b73edb253af9c2ea9dfec2",
+    "dbn_config_sha256": "ce99d7321660576b56d7a5ff01e544aecf38428e6b54c7c96313d57cf1908768",
+    "git_commit": "25e20ee0e3a6b89680002382ebf883d31a698c04",
+    "network_xml_sha256s": {
+      "grid3x3_rush_asymmetric": "6f9a01c8bc6d228003fa3ce68b8a6c6235c0420f80ec294195e323724e1de220",
+      "osm_palo_alto_rush": "7fc5f42f9921182f1d8a60834f0c876ccdcf2adc03f7f6e2a3d61c3763853492"
+    },
+    "num_episodes": 90,
+    "policies": [
+      "actuated_signal",
+      "online_bic_dbn",
+      "neural_dbn"
+    ],
+    "require_test_seeds": true,
+    "scenario_config_sha256s": {
+      "grid3x3_rush_asymmetric": "3843b08d87e4920b5a2540369e93d99402ef3e5af4d4c6d7eb681c4ae1c34ea2",
+      "osm_palo_alto_rush": "1434f312cdee4d1e85af443e00559017e1ce7c1f5f05c68aaa6bfc2d3da68ccd"
+    },
+    "scenarios": [
+      "grid3x3_rush_asymmetric",
+      "osm_palo_alto_rush"
+    ],
+    "schema_version": 2,
+    "seeds": [
+      3000,
+      3001,
+      3002,
+      3003,
+      3004,
+      3005,
+      3006,
+      3007,
+      3008,
+      3009,
+      3010,
+      3011,
+      3012,
+      3013,
+      3014
+    ]
+  },
+  "scenario_ids": [
+    "grid3x3_rush_asymmetric",
+    "osm_palo_alto_rush"
+  ],
+  "scenarios": {
+    "grid3x3_rush_asymmetric": {
+      "paired_comparisons": {
+        "actuated_signal": {
+          "cohort_completion_rate": {
+            "ci95_high": 0.028701688631916578,
+            "ci95_low": 0.010557519721622706,
+            "mean_diff": 0.019032063137407233,
+            "p_value_holm": 0.000244140625,
+            "p_value_raw": 0.000244140625,
+            "relative_change_pct": 1.9435134138818377,
+            "significance_stars": "***",
+            "wtl_summary": "13/2/0"
+          },
+          "cohort_mean_total_delay_s": {
+            "ci95_high": -13.179912333410329,
+            "ci95_low": -18.57543521374082,
+            "mean_diff": -15.997953102585207,
+            "p_value_holm": 0.0001220703125,
+            "p_value_raw": 6.103515625e-05,
+            "relative_change_pct": -14.85415832875375,
+            "significance_stars": "***",
+            "wtl_summary": "15/0/0"
+          },
+          "cohort_p95_total_delay_s": {
+            "ci95_high": -27.533931666666664,
+            "ci95_low": -41.072900000000004,
+            "mean_diff": -34.20453333333333,
+            "p_value_holm": 0.0001220703125,
+            "p_value_raw": 6.103515625e-05,
+            "relative_change_pct": -17.753036776960233,
+            "significance_stars": "***",
+            "wtl_summary": "15/0/0"
+          },
+          "edge_churn_hamming_rate": {
+            "ci95_high": 0.3232229462468776,
+            "ci95_low": 0.30975267446843796,
+            "mean_diff": 0.31618700497749724,
+            "p_value_holm": 0.0001220703125,
+            "p_value_raw": 6.103515625e-05,
+            "relative_change_pct": null,
+            "significance_stars": "***",
+            "wtl_summary": "0/0/15"
+          },
+          "mean_co2_g_per_veh": {
+            "ci95_high": -19.380210942445142,
+            "ci95_low": -26.83769192345358,
+            "mean_diff": -23.20388678703341,
+            "p_value_holm": 0.0001220703125,
+            "p_value_raw": 6.103515625e-05,
+            "relative_change_pct": -8.921431405973987,
+            "significance_stars": "***",
+            "wtl_summary": "15/0/0"
+          },
+          "spillback_corridor_seconds": {
+            "ci95_high": -1157.3325,
+            "ci95_low": -1351.6758333333335,
+            "mean_diff": -1250.1333333333334,
+            "p_value_holm": 0.0001220703125,
+            "p_value_raw": 6.103515625e-05,
+            "relative_change_pct": -99.22218106778136,
+            "significance_stars": "***",
+            "wtl_summary": "15/0/0"
+          },
+          "throughput_veh_per_hr": {
+            "ci95_high": 220.02499999999964,
+            "ci95_low": 79.0,
+            "mean_diff": 146.0,
+            "p_value_holm": 0.000244140625,
+            "p_value_raw": 0.000244140625,
+            "relative_change_pct": 1.9880174291938997,
+            "significance_stars": "***",
+            "wtl_summary": "13/2/0"
+          }
+        },
+        "online_bic_dbn": {
+          "cohort_completion_rate": {
+            "ci95_high": 0.5976962581442873,
+            "ci95_low": 0.4970150281722579,
+            "mean_diff": 0.5434437793727164,
+            "p_value_holm": 0.0001220703125,
+            "p_value_raw": 6.103515625e-05,
+            "relative_change_pct": 119.47784739465334,
+            "significance_stars": "***",
+            "wtl_summary": "15/0/0"
+          },
+          "cohort_mean_total_delay_s": {
+            "ci95_high": -124.59826901466687,
+            "ci95_low": -142.82762533574194,
+            "mean_diff": -132.70382451690637,
+            "p_value_holm": 0.0001220703125,
+            "p_value_raw": 6.103515625e-05,
+            "relative_change_pct": -59.13558580957893,
+            "significance_stars": "***",
+            "wtl_summary": "15/0/0"
+          },
+          "cohort_p95_total_delay_s": {
+            "ci95_high": -215.55189000000001,
+            "ci95_low": -235.06771083333334,
+            "mean_diff": -225.67863333333332,
+            "p_value_holm": 0.0001220703125,
+            "p_value_raw": 6.103515625e-05,
+            "relative_change_pct": -58.74864047929407,
+            "significance_stars": "***",
+            "wtl_summary": "15/0/0"
+          },
+          "edge_churn_hamming_rate": {
+            "ci95_high": 0.1261296258952596,
+            "ci95_low": 0.10713595997335153,
+            "mean_diff": 0.11687430426597373,
+            "p_value_holm": 0.0001220703125,
+            "p_value_raw": 6.103515625e-05,
+            "relative_change_pct": 58.638663692151006,
+            "significance_stars": "***",
+            "wtl_summary": "0/0/15"
+          },
+          "mean_co2_g_per_veh": {
+            "ci95_high": -110.8316376336304,
+            "ci95_low": -136.10537019051407,
+            "mean_diff": -121.96917285018316,
+            "p_value_holm": 0.0001220703125,
+            "p_value_raw": 6.103515625e-05,
+            "relative_change_pct": -33.98825656492945,
+            "significance_stars": "***",
+            "wtl_summary": "15/0/0"
+          },
+          "spillback_corridor_seconds": {
+            "ci95_high": 6.366666666666666,
+            "ci95_low": -6.1,
+            "mean_diff": -0.6666666666666666,
+            "p_value_holm": 0.14817787189628498,
+            "p_value_raw": 0.14817787189628498,
+            "relative_change_pct": -6.369426751592355,
+            "significance_stars": "ns",
+            "wtl_summary": "11/1/3"
+          },
+          "throughput_veh_per_hr": {
+            "ci95_high": 4504.0,
+            "ci95_low": 3700.0,
+            "mean_diff": 4086.0,
+            "p_value_holm": 0.0001220703125,
+            "p_value_raw": 6.103515625e-05,
+            "relative_change_pct": 120.0352526439483,
+            "significance_stars": "***",
+            "wtl_summary": "15/0/0"
+          }
+        }
+      },
+      "policies": {
+        "actuated_signal": {
+          "cohort_completion_rate": {
+            "ci95_high": 0.9882515192416321,
+            "ci95_low": 0.9691153191936944,
+            "mean": 0.9792607039121959,
+            "median": 0.9797421731123389,
+            "n_seeds": 15,
+            "p95": 0.9985971943887776,
+            "std": 0.01980785092744334
+          },
+          "cohort_mean_total_delay_s": {
+            "ci95_high": 112.40429776216646,
+            "ci95_low": 102.4936716261208,
+            "mean": 107.70016549249627,
+            "median": 107.73309392265193,
+            "n_seeds": 15,
+            "p95": 121.74866536478673,
+            "std": 10.00352530586037
+          },
+          "cohort_p95_total_delay_s": {
+            "ci95_high": 203.97608666666665,
+            "ci95_low": 181.35912750000006,
+            "mean": 192.66863333333333,
+            "median": 194.55999999999995,
+            "n_seeds": 15,
+            "p95": 222.42194999999992,
+            "std": 22.874087619951922
+          },
+          "collision_count": {
+            "ci95_high": 0.0,
+            "ci95_low": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "n_seeds": 15,
+            "p95": 0.0,
+            "std": 0.0
+          },
+          "edge_churn_hamming_rate": {
+            "ci95_high": 0.0,
+            "ci95_low": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "n_seeds": 15,
+            "p95": 0.0,
+            "std": 0.0
+          },
+          "mean_co2_g_per_veh": {
+            "ci95_high": 266.8857123807246,
+            "ci95_low": 252.8174918283834,
+            "mean": 260.0915226618856,
+            "median": 260.45362534404757,
+            "n_seeds": 15,
+            "p95": 278.76003407271713,
+            "std": 14.414960110965492
+          },
+          "mean_dbn_update_latency_ms": {
+            "ci95_high": 0.0,
+            "ci95_low": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "n_seeds": 15,
+            "p95": 0.0,
+            "std": 0.0
+          },
+          "mean_stops_per_veh": {
+            "ci95_high": 4.168951148293643,
+            "ci95_low": 3.9830602324176754,
+            "mean": 4.079415161928749,
+            "median": 4.106471816283925,
+            "n_seeds": 15,
+            "p95": 4.3344550044550045,
+            "std": 0.19145281019968477
+          },
+          "safety_filter_clamp_rate": {
+            "ci95_high": 0.0,
+            "ci95_low": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "n_seeds": 15,
+            "p95": 0.0,
+            "std": 0.0
+          },
+          "spillback_corridor_seconds": {
+            "ci95_high": 1360.3016666666665,
+            "ci95_low": 1169.1633333333334,
+            "mean": 1259.9333333333334,
+            "median": 1243.5,
+            "n_seeds": 15,
+            "p95": 1615.4499999999998,
+            "std": 198.93895929105875
+          },
+          "teleport_count": {
+            "ci95_high": 0.0,
+            "ci95_low": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "n_seeds": 15,
+            "p95": 0.0,
+            "std": 0.0
+          },
+          "throughput_veh_per_hr": {
+            "ci95_high": 7487.0,
+            "ci95_low": 7203.0,
+            "mean": 7344.0,
+            "median": 7365.0,
+            "n_seeds": 15,
+            "p95": 7728.0,
+            "std": 290.7944782340761
+          },
+          "v2x_delivery_efficiency": {
+            "ci95_high": 1.0,
+            "ci95_low": 1.0,
+            "mean": 1.0,
+            "median": 1.0,
+            "n_seeds": 15,
+            "p95": 1.0,
+            "std": 0.0
+          }
+        },
+        "neural_dbn": {
+          "cohort_completion_rate": {
+            "ci95_high": 0.9996006001186991,
+            "ci95_low": 0.9967338195356727,
+            "mean": 0.9982927670496032,
+            "median": 1.0,
+            "n_seeds": 15,
+            "p95": 1.0,
+            "std": 0.002954793291369555
+          },
+          "cohort_mean_total_delay_s": {
+            "ci95_high": 96.00647923143528,
+            "ci95_low": 87.17161689924673,
+            "mean": 91.70221238991104,
+            "median": 89.98040384615385,
+            "n_seeds": 15,
+            "p95": 104.2740771987457,
+            "std": 9.28153272776787
+          },
+          "cohort_p95_total_delay_s": {
+            "ci95_high": 168.48280666666662,
+            "ci95_low": 148.93096666666665,
+            "mean": 158.4641,
+            "median": 153.016,
+            "n_seeds": 15,
+            "p95": 190.94489999999996,
+            "std": 19.690328177088066
+          },
+          "collision_count": {
+            "ci95_high": 4.8,
+            "ci95_low": 0.0,
+            "mean": 1.6,
+            "median": 0.0,
+            "n_seeds": 15,
+            "p95": 7.199999999999974,
+            "std": 6.1967733539318655
+          },
+          "edge_churn_hamming_rate": {
+            "ci95_high": 0.323294760418907,
+            "ci95_low": 0.3094716258011998,
+            "mean": 0.31618700497749724,
+            "median": 0.31280229553024624,
+            "n_seeds": 15,
+            "p95": 0.3387330729721854,
+            "std": 0.013986592372665141
+          },
+          "mean_co2_g_per_veh": {
+            "ci95_high": 242.81957240000463,
+            "ci95_low": 230.42697025689816,
+            "mean": 236.8876358748522,
+            "median": 235.41368008685322,
+            "n_seeds": 15,
+            "p95": 252.96371666019135,
+            "std": 12.818778965269711
+          },
+          "mean_dbn_update_latency_ms": {
+            "ci95_high": 68.44314508872338,
+            "ci95_low": 61.06879506906593,
+            "mean": 64.94568145086265,
+            "median": 67.95865278370911,
+            "n_seeds": 15,
+            "p95": 73.56690859738835,
+            "std": 7.581375514122442
+          },
+          "mean_stops_per_veh": {
+            "ci95_high": 5.726222807716786,
+            "ci95_low": 5.3604375195349485,
+            "mean": 5.551732320429466,
+            "median": 5.644567219152854,
+            "n_seeds": 15,
+            "p95": 5.952551619942924,
+            "std": 0.37523718344870644
+          },
+          "safety_filter_clamp_rate": {
+            "ci95_high": 0.2122213839219413,
+            "ci95_low": 0.20111897535763584,
+            "mean": 0.20707709636333593,
+            "median": 0.20668963471674007,
+            "n_seeds": 15,
+            "p95": 0.2208649119234237,
+            "std": 0.011315531033851998
+          },
+          "spillback_corridor_seconds": {
+            "ci95_high": 17.633333333333333,
+            "ci95_low": 4.033333333333333,
+            "mean": 9.8,
+            "median": 3.5,
+            "n_seeds": 15,
+            "p95": 42.849999999999994,
+            "std": 14.055756319539897
+          },
+          "teleport_count": {
+            "ci95_high": 0.0,
+            "ci95_low": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "n_seeds": 15,
+            "p95": 0.0,
+            "std": 0.0
+          },
+          "throughput_veh_per_hr": {
+            "ci95_high": 7654.0,
+            "ci95_low": 7316.0,
+            "mean": 7490.0,
+            "median": 7500.0,
+            "n_seeds": 15,
+            "p95": 7899.0,
+            "std": 341.42558277233496
+          },
+          "v2x_delivery_efficiency": {
+            "ci95_high": 0.9165194735322607,
+            "ci95_low": 0.9133053782042758,
+            "mean": 0.9147982865989174,
+            "median": 0.9141481679593474,
+            "n_seeds": 15,
+            "p95": 0.920274581844208,
+            "std": 0.003324574374264894
+          }
+        },
+        "online_bic_dbn": {
+          "cohort_completion_rate": {
+            "ci95_high": 0.502632600731584,
+            "ci95_low": 0.39890199982411667,
+            "mean": 0.4548489876768868,
+            "median": 0.47882136279926335,
+            "n_seeds": 15,
+            "p95": 0.5641394847683415,
+            "std": 0.10420507475697224
+          },
+          "cohort_mean_total_delay_s": {
+            "ci95_high": 235.15106877320173,
+            "ci95_low": 214.07818498552004,
+            "mean": 224.4060369068174,
+            "median": 221.67443064182194,
+            "n_seeds": 15,
+            "p95": 253.9267367606118,
+            "std": 21.610675216404946
+          },
+          "cohort_p95_total_delay_s": {
+            "ci95_high": 393.47528083333333,
+            "ci95_low": 372.29195166666653,
+            "mean": 384.1427333333333,
+            "median": 388.126,
+            "n_seeds": 15,
+            "p95": 407.7725,
+            "std": 22.11379810036732
+          },
+          "collision_count": {
+            "ci95_high": 0.0,
+            "ci95_low": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "n_seeds": 15,
+            "p95": 0.0,
+            "std": 0.0
+          },
+          "edge_churn_hamming_rate": {
+            "ci95_high": 0.20746237759326722,
+            "ci95_low": 0.19247608992445625,
+            "mean": 0.19931270071152352,
+            "median": 0.1938209632348153,
+            "n_seeds": 15,
+            "p95": 0.22475603075433717,
+            "std": 0.015427886523595585
+          },
+          "mean_co2_g_per_veh": {
+            "ci95_high": 372.97763914817256,
+            "ci95_low": 347.2398625270289,
+            "mean": 358.85680872503536,
+            "median": 348.7084083071494,
+            "n_seeds": 15,
+            "p95": 404.775136552271,
+            "std": 26.724084494899042
+          },
+          "mean_dbn_update_latency_ms": {
+            "ci95_high": 62.13857322548156,
+            "ci95_low": 57.71776062259344,
+            "mean": 59.94774879683021,
+            "median": 60.54307755947971,
+            "n_seeds": 15,
+            "p95": 66.03700336410695,
+            "std": 4.603610149510471
+          },
+          "mean_stops_per_veh": {
+            "ci95_high": 6.12499894552948,
+            "ci95_low": 5.341745957281494,
+            "mean": 5.756684268331673,
+            "median": 5.997975708502024,
+            "n_seeds": 15,
+            "p95": 6.585515300230947,
+            "std": 0.7932063981568224
+          },
+          "safety_filter_clamp_rate": {
+            "ci95_high": 0.13014618815811071,
+            "ci95_low": 0.11272219470487171,
+            "mean": 0.12194384889912831,
+            "median": 0.1260475408076488,
+            "n_seeds": 15,
+            "p95": 0.13998530281052432,
+            "std": 0.018043051582381547
+          },
+          "spillback_corridor_seconds": {
+            "ci95_high": 11.966666666666667,
+            "ci95_low": 8.933333333333334,
+            "mean": 10.466666666666667,
+            "median": 11.0,
+            "n_seeds": 15,
+            "p95": 14.299999999999999,
+            "std": 3.125166662222459
+          },
+          "teleport_count": {
+            "ci95_high": 0.0,
+            "ci95_low": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "n_seeds": 15,
+            "p95": 0.0,
+            "std": 0.0
+          },
+          "throughput_veh_per_hr": {
+            "ci95_high": 3736.0,
+            "ci95_low": 3014.975,
+            "mean": 3404.0,
+            "median": 3660.0,
+            "n_seeds": 15,
+            "p95": 4079.9999999999995,
+            "std": 742.6670086346139
+          },
+          "v2x_delivery_efficiency": {
+            "ci95_high": 0.9204809371188308,
+            "ci95_low": 0.9173018781250245,
+            "mean": 0.9189145196082641,
+            "median": 0.9195756753422968,
+            "n_seeds": 15,
+            "p95": 0.9227279149912723,
+            "std": 0.0032898168591039153
+          }
+        }
+      }
+    },
+    "osm_palo_alto_rush": {
+      "paired_comparisons": {
+        "actuated_signal": {
+          "cohort_completion_rate": {
+            "ci95_high": 0.1215849505643262,
+            "ci95_low": 0.07522082178896075,
+            "mean_diff": 0.09929211843154047,
+            "p_value_holm": 0.0001220703125,
+            "p_value_raw": 6.103515625e-05,
+            "relative_change_pct": 14.260586606749591,
+            "significance_stars": "***",
+            "wtl_summary": "15/0/0"
+          },
+          "cohort_mean_total_delay_s": {
+            "ci95_high": -1.948346689131245,
+            "ci95_low": -12.31133385948974,
+            "mean_diff": -7.207184506194559,
+            "p_value_holm": 0.060302734375,
+            "p_value_raw": 0.0301513671875,
+            "relative_change_pct": -5.077926455077377,
+            "significance_stars": "ns",
+            "wtl_summary": "11/0/4"
+          },
+          "cohort_p95_total_delay_s": {
+            "ci95_high": -3.0189383333333604,
+            "ci95_low": -40.63788333333335,
+            "mean_diff": -21.63456666666667,
+            "p_value_holm": 0.1107177734375,
+            "p_value_raw": 0.05535888671875,
+            "relative_change_pct": -6.8579361768583125,
+            "significance_stars": "ns",
+            "wtl_summary": "11/0/4"
+          },
+          "edge_churn_hamming_rate": {
+            "ci95_high": 0.2294482930217236,
+            "ci95_low": 0.2184779717312254,
+            "mean_diff": 0.2242472133405379,
+            "p_value_holm": 0.0001220703125,
+            "p_value_raw": 6.103515625e-05,
+            "relative_change_pct": null,
+            "significance_stars": "***",
+            "wtl_summary": "0/0/15"
+          },
+          "mean_co2_g_per_veh": {
+            "ci95_high": 15.800178125556743,
+            "ci95_low": 7.789395746027171,
+            "mean_diff": 11.814654703346681,
+            "p_value_holm": 0.0003662109375,
+            "p_value_raw": 0.00018310546875,
+            "relative_change_pct": 3.0946346027715483,
+            "significance_stars": "***",
+            "wtl_summary": "1/0/14"
+          },
+          "spillback_corridor_seconds": {
+            "ci95_high": -854.6325,
+            "ci95_low": -1512.9675,
+            "mean_diff": -1185.3333333333333,
+            "p_value_holm": 0.0001220703125,
+            "p_value_raw": 6.103515625e-05,
+            "relative_change_pct": -43.89039743273266,
+            "significance_stars": "***",
+            "wtl_summary": "15/0/0"
+          },
+          "throughput_veh_per_hr": {
+            "ci95_high": 675.0,
+            "ci95_low": 414.0,
+            "mean_diff": 546.0,
+            "p_value_holm": 0.0013000484774361254,
+            "p_value_raw": 0.0006500242387180627,
+            "relative_change_pct": 14.40253231337378,
+            "significance_stars": "**",
+            "wtl_summary": "15/0/0"
+          }
+        },
+        "online_bic_dbn": {
+          "cohort_completion_rate": {
+            "ci95_high": 0.038796684360931304,
+            "ci95_low": -0.0006269842673366642,
+            "mean_diff": 0.01829354723816194,
+            "p_value_holm": 0.072998046875,
+            "p_value_raw": 0.072998046875,
+            "relative_change_pct": 2.3535698120567377,
+            "significance_stars": "ns",
+            "wtl_summary": "12/0/3"
+          },
+          "cohort_mean_total_delay_s": {
+            "ci95_high": 0.6728110919879876,
+            "ci95_low": -6.410427230359705,
+            "mean_diff": -2.64817023397092,
+            "p_value_holm": 0.25238037109375,
+            "p_value_raw": 0.25238037109375,
+            "relative_change_pct": -1.927727696858038,
+            "significance_stars": "ns",
+            "wtl_summary": "9/0/6"
+          },
+          "cohort_p95_total_delay_s": {
+            "ci95_high": 13.585108333333306,
+            "ci95_low": -4.6707225000000046,
+            "mean_diff": 4.236199999999997,
+            "p_value_holm": 0.52447509765625,
+            "p_value_raw": 0.52447509765625,
+            "relative_change_pct": 1.462792238174795,
+            "significance_stars": "ns",
+            "wtl_summary": "6/0/9"
+          },
+          "edge_churn_hamming_rate": {
+            "ci95_high": 0.10329894708446266,
+            "ci95_low": 0.09254235548021528,
+            "mean_diff": 0.0982287649924731,
+            "p_value_holm": 0.0001220703125,
+            "p_value_raw": 6.103515625e-05,
+            "relative_change_pct": 77.94792451432492,
+            "significance_stars": "***",
+            "wtl_summary": "0/0/15"
+          },
+          "mean_co2_g_per_veh": {
+            "ci95_high": -1.0045601712934131,
+            "ci95_low": -6.006956037405579,
+            "mean_diff": -3.4837463369292854,
+            "p_value_holm": 0.00836181640625,
+            "p_value_raw": 0.00836181640625,
+            "relative_change_pct": -0.8773476552276545,
+            "significance_stars": "**",
+            "wtl_summary": "11/0/4"
+          },
+          "spillback_corridor_seconds": {
+            "ci95_high": 197.2675,
+            "ci95_low": 10.193333333333339,
+            "mean_diff": 104.56666666666666,
+            "p_value_holm": 0.072998046875,
+            "p_value_raw": 0.072998046875,
+            "relative_change_pct": 7.412045459915412,
+            "significance_stars": "ns",
+            "wtl_summary": "4/0/11"
+          },
+          "throughput_veh_per_hr": {
+            "ci95_high": 212.0,
+            "ci95_low": -3.0,
+            "mean_diff": 102.0,
+            "p_value_holm": 0.07331158795794013,
+            "p_value_raw": 0.07331158795794013,
+            "relative_change_pct": 2.408500590318772,
+            "significance_stars": "ns",
+            "wtl_summary": "12/0/3"
+          }
+        }
+      },
+      "policies": {
+        "actuated_signal": {
+          "cohort_completion_rate": {
+            "ci95_high": 0.7314352912912538,
+            "ci95_low": 0.661383239600146,
+            "mean": 0.6962695236151444,
+            "median": 0.695054945054945,
+            "n_seeds": 15,
+            "p95": 0.7926610208447517,
+            "std": 0.07194200185653746
+          },
+          "cohort_mean_total_delay_s": {
+            "ci95_high": 149.81745834308472,
+            "ci95_low": 133.98417888709824,
+            "mean": 141.93164414557745,
+            "median": 139.15791208791208,
+            "n_seeds": 15,
+            "p95": 165.17316821795617,
+            "std": 16.75274424902585
+          },
+          "cohort_p95_total_delay_s": {
+            "ci95_high": 333.5493841666667,
+            "ci95_low": 297.14077166666664,
+            "mean": 315.46759999999995,
+            "median": 302.73299999999995,
+            "n_seeds": 15,
+            "p95": 363.99285,
+            "std": 37.41170914499897
+          },
+          "collision_count": {
+            "ci95_high": 1.2666666666666666,
+            "ci95_low": 0.26666666666666666,
+            "mean": 0.7333333333333333,
+            "median": 0.0,
+            "n_seeds": 15,
+            "p95": 2.299999999999999,
+            "std": 1.0997835284835873
+          },
+          "edge_churn_hamming_rate": {
+            "ci95_high": 0.0,
+            "ci95_low": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "n_seeds": 15,
+            "p95": 0.0,
+            "std": 0.0
+          },
+          "mean_co2_g_per_veh": {
+            "ci95_high": 388.9060382250094,
+            "ci95_low": 374.5438332566151,
+            "mean": 381.7786659777378,
+            "median": 381.035736443346,
+            "n_seeds": 15,
+            "p95": 402.87524350534,
+            "std": 14.70680860718287
+          },
+          "mean_dbn_update_latency_ms": {
+            "ci95_high": 0.0,
+            "ci95_low": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "n_seeds": 15,
+            "p95": 0.0,
+            "std": 0.0
+          },
+          "mean_stops_per_veh": {
+            "ci95_high": 5.278326472422273,
+            "ci95_low": 4.782160257371059,
+            "mean": 5.028589825072855,
+            "median": 5.032345013477089,
+            "n_seeds": 15,
+            "p95": 5.807500347753512,
+            "std": 0.5052200566447669
+          },
+          "safety_filter_clamp_rate": {
+            "ci95_high": 0.0,
+            "ci95_low": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "n_seeds": 15,
+            "p95": 0.0,
+            "std": 0.0
+          },
+          "spillback_corridor_seconds": {
+            "ci95_high": 3078.5741666666663,
+            "ci95_low": 2309.9983333333334,
+            "mean": 2700.6666666666665,
+            "median": 2646.0,
+            "n_seeds": 15,
+            "p95": 3765.45,
+            "std": 785.5014018962362
+          },
+          "teleport_count": {
+            "ci95_high": 0.0,
+            "ci95_low": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "n_seeds": 15,
+            "p95": 0.0,
+            "std": 0.0
+          },
+          "throughput_veh_per_hr": {
+            "ci95_high": 3944.0,
+            "ci95_low": 3635.0,
+            "mean": 3791.0,
+            "median": 3870.0,
+            "n_seeds": 15,
+            "p95": 4164.0,
+            "std": 323.87828401599086
+          },
+          "v2x_delivery_efficiency": {
+            "ci95_high": 1.0,
+            "ci95_low": 1.0,
+            "mean": 1.0,
+            "median": 1.0,
+            "n_seeds": 15,
+            "p95": 1.0,
+            "std": 0.0
+          }
+        },
+        "neural_dbn": {
+          "cohort_completion_rate": {
+            "ci95_high": 0.8188319520224577,
+            "ci95_low": 0.7734075772969413,
+            "mean": 0.7955616420466849,
+            "median": 0.7851239669421488,
+            "n_seeds": 15,
+            "p95": 0.8756519509909655,
+            "std": 0.04629729345153889
+          },
+          "cohort_mean_total_delay_s": {
+            "ci95_high": 140.23837645133952,
+            "ci95_low": 129.18224449886154,
+            "mean": 134.72445963938287,
+            "median": 135.55088154269973,
+            "n_seeds": 15,
+            "p95": 151.68501822392264,
+            "std": 11.268920766300557
+          },
+          "cohort_p95_total_delay_s": {
+            "ci95_high": 312.72107583333326,
+            "ci95_low": 275.59399999999994,
+            "mean": 293.8330333333333,
+            "median": 290.83299999999997,
+            "n_seeds": 15,
+            "p95": 346.51249999999993,
+            "std": 37.67573606848819
+          },
+          "collision_count": {
+            "ci95_high": 0.0,
+            "ci95_low": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "n_seeds": 15,
+            "p95": 0.0,
+            "std": 0.0
+          },
+          "edge_churn_hamming_rate": {
+            "ci95_high": 0.22940014020149663,
+            "ci95_low": 0.21823579210312083,
+            "mean": 0.2242472133405379,
+            "median": 0.22618404529834588,
+            "n_seeds": 15,
+            "p95": 0.23780492735199615,
+            "std": 0.011375426222056242
+          },
+          "mean_co2_g_per_veh": {
+            "ci95_high": 398.9084092915951,
+            "ci95_low": 388.25885492267315,
+            "mean": 393.5933206810844,
+            "median": 391.23378227587347,
+            "n_seeds": 15,
+            "p95": 410.23336371967343,
+            "std": 10.886141680631493
+          },
+          "mean_dbn_update_latency_ms": {
+            "ci95_high": 71.73084001931015,
+            "ci95_low": 65.71214071391447,
+            "mean": 68.77211302484298,
+            "median": 68.20431654467096,
+            "n_seeds": 15,
+            "p95": 77.45626560746825,
+            "std": 6.278800662348116
+          },
+          "mean_stops_per_veh": {
+            "ci95_high": 10.136414516972643,
+            "ci95_low": 9.384198915255288,
+            "mean": 9.766770250264374,
+            "median": 10.022408963585434,
+            "n_seeds": 15,
+            "p95": 10.718588242358734,
+            "std": 0.7677242903459633
+          },
+          "safety_filter_clamp_rate": {
+            "ci95_high": 0.14285738175700466,
+            "ci95_low": 0.1330285693413609,
+            "mean": 0.13793925831643825,
+            "median": 0.13818602907965674,
+            "n_seeds": 15,
+            "p95": 0.15182147334669777,
+            "std": 0.010307024368074331
+          },
+          "spillback_corridor_seconds": {
+            "ci95_high": 1693.1516666666664,
+            "ci95_low": 1334.0658333333333,
+            "mean": 1515.3333333333333,
+            "median": 1500.5,
+            "n_seeds": 15,
+            "p95": 2059.6,
+            "std": 366.3452054057887
+          },
+          "teleport_count": {
+            "ci95_high": 0.0,
+            "ci95_low": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "n_seeds": 15,
+            "p95": 0.0,
+            "std": 0.0
+          },
+          "throughput_veh_per_hr": {
+            "ci95_high": 4448.0,
+            "ci95_low": 4227.0,
+            "mean": 4337.0,
+            "median": 4380.0,
+            "n_seeds": 15,
+            "p95": 4638.0,
+            "std": 226.05941064874327
+          },
+          "v2x_delivery_efficiency": {
+            "ci95_high": 0.9199213981718822,
+            "ci95_low": 0.916995328227072,
+            "mean": 0.9184598366057561,
+            "median": 0.9183864915572233,
+            "n_seeds": 15,
+            "p95": 0.922464556768082,
+            "std": 0.0030101060001878188
+          }
+        },
+        "online_bic_dbn": {
+          "cohort_completion_rate": {
+            "ci95_high": 0.8086932320208287,
+            "ci95_low": 0.7414185222648458,
+            "mean": 0.7772680948085229,
+            "median": 0.7878787878787878,
+            "n_seeds": 15,
+            "p95": 0.8503032124608829,
+            "std": 0.06894294087723023
+          },
+          "cohort_mean_total_delay_s": {
+            "ci95_high": 145.22300690703506,
+            "ci95_low": 130.39004263462442,
+            "mean": 137.3726298733538,
+            "median": 139.10903581267218,
+            "n_seeds": 15,
+            "p95": 168.37995935216617,
+            "std": 15.20533132841425
+          },
+          "cohort_p95_total_delay_s": {
+            "ci95_high": 308.4415791666665,
+            "ci95_low": 272.4261983333333,
+            "mean": 289.5968333333333,
+            "median": 282.40399999999994,
+            "n_seeds": 15,
+            "p95": 344.0227999999999,
+            "std": 36.6156171948463
+          },
+          "collision_count": {
+            "ci95_high": 0.0,
+            "ci95_low": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "n_seeds": 15,
+            "p95": 0.0,
+            "std": 0.0
+          },
+          "edge_churn_hamming_rate": {
+            "ci95_high": 0.12854558324684054,
+            "ci95_low": 0.12338694318172307,
+            "mean": 0.1260184483480648,
+            "median": 0.1271938140046217,
+            "n_seeds": 15,
+            "p95": 0.13307761742054808,
+            "std": 0.005319882562190625
+          },
+          "mean_co2_g_per_veh": {
+            "ci95_high": 403.671001458119,
+            "ci95_low": 390.90500816164285,
+            "mean": 397.0770670180137,
+            "median": 394.03318850069576,
+            "n_seeds": 15,
+            "p95": 416.9695352444063,
+            "std": 13.162815452146218
+          },
+          "mean_dbn_update_latency_ms": {
+            "ci95_high": 29.265023675049083,
+            "ci95_low": 25.989783556550265,
+            "mean": 27.62449702710405,
+            "median": 27.129654927853995,
+            "n_seeds": 15,
+            "p95": 31.79908684050638,
+            "std": 3.37008791748413
+          },
+          "mean_stops_per_veh": {
+            "ci95_high": 9.464113277337407,
+            "ci95_low": 8.841427231340822,
+            "mean": 9.164718917961396,
+            "median": 9.326923076923077,
+            "n_seeds": 15,
+            "p95": 9.867740429505137,
+            "std": 0.6338516409122763
+          },
+          "safety_filter_clamp_rate": {
+            "ci95_high": 0.13490127353848133,
+            "ci95_low": 0.12680428256860335,
+            "mean": 0.13076295188068418,
+            "median": 0.12931067625235476,
+            "n_seeds": 15,
+            "p95": 0.14378885751620799,
+            "std": 0.008415667550810503
+          },
+          "spillback_corridor_seconds": {
+            "ci95_high": 1643.8008333333332,
+            "ci95_low": 1194.6325000000002,
+            "mean": 1410.7666666666667,
+            "median": 1446.5,
+            "n_seeds": 15,
+            "p95": 2253.2999999999997,
+            "std": 460.6978350699027
+          },
+          "teleport_count": {
+            "ci95_high": 0.0,
+            "ci95_low": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "n_seeds": 15,
+            "p95": 0.0,
+            "std": 0.0
+          },
+          "throughput_veh_per_hr": {
+            "ci95_high": 4381.0,
+            "ci95_low": 4062.0,
+            "mean": 4235.0,
+            "median": 4290.0,
+            "n_seeds": 15,
+            "p95": 4549.5,
+            "std": 333.2791622649097
+          },
+          "v2x_delivery_efficiency": {
+            "ci95_high": 0.9199881729798246,
+            "ci95_low": 0.9174284129924466,
+            "mean": 0.9186604866526354,
+            "median": 0.9181382294468483,
+            "n_seeds": 15,
+            "p95": 0.9230734676577852,
+            "std": 0.00262583138029016
+          }
+        }
+      }
+    }
+  },
+  "schema_version": 2,
+  "seeds": [
+    3000,
+    3001,
+    3002,
+    3003,
+    3004,
+    3005,
+    3006,
+    3007,
+    3008,
+    3009,
+    3010,
+    3011,
+    3012,
+    3013,
+    3014
+  ]
+}

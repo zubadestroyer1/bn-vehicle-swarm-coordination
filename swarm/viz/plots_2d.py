@@ -346,9 +346,9 @@ def plot_scenario_comparison(
     if not ordered_policies:
         raise ConfigValidationError("No policies found across scenarios in plot_scenario_comparison.")
 
-    fig = Figure(figsize=(13.2, 6.4), dpi=dpi)
+    fig = Figure(figsize=(13.4, 6.8), dpi=dpi)
     axes = fig.subplots(2, 1, sharex=True)
-    fig.subplots_adjust(hspace=0.18, top=0.86, bottom=0.14, left=0.08, right=0.98)
+    fig.subplots_adjust(hspace=0.22, top=0.81, bottom=0.12, left=0.08, right=0.98)
 
     panel_specs = (
         ("cohort_mean_total_delay_s", "Cohort Mean Total Delay [s]\n(incl. unfinished & undeparted)", "(a) Multi-Scenario Travel Delay"),
@@ -419,15 +419,15 @@ def plot_scenario_comparison(
                 zorder=4,
             )
 
-        ax.set_ylabel(ylabel, fontsize=9.0, fontweight="semibold", color="#0f172a")
+        ax.set_ylabel(ylabel, fontsize=9.0, fontweight="bold", color="#0f172a")
         ax.set_title(panel_title, loc="left", fontsize=10.0, fontweight="bold", color="#0f172a", pad=5)
         ax.set_ylim(bottom=0.0)
 
     axes[-1].set_xticks(x_centers)
-    axes[-1].set_xticklabels([_scenario_label(sid) for sid in scen_ids], fontsize=8.8, fontweight="medium")
+    axes[-1].set_xticklabels([_scenario_label(sid) for sid in scen_ids], fontsize=8.8, fontweight="normal")
     axes[0].legend(
         loc="upper center",
-        bbox_to_anchor=(0.5, 1.33),
+        bbox_to_anchor=(0.5, 1.35),
         ncol=min(4, n_pol),
         frameon=True,
         facecolor="#ffffff",
@@ -439,7 +439,7 @@ def plot_scenario_comparison(
         fontsize=11.5,
         fontweight="bold",
         color="#0f172a",
-        y=0.97,
+        y=1.01,
     )
     return _save_figure_atomic(fig, output_path, dpi=dpi)
 
@@ -508,10 +508,12 @@ def plot_paired_forest(
         )
 
     n_rows = len(rows)
-    fig_h = max(4.4, 1.35 + 0.36 * n_rows)
-    fig = Figure(figsize=(11.8, fig_h), dpi=dpi)
+    fig_h = max(4.4, 1.30 + 0.34 * n_rows)
+    fig = Figure(figsize=(12.2, fig_h), dpi=dpi)
     ax = fig.subplots(1, 1)
-    fig.subplots_adjust(left=0.28, right=0.69, top=0.88, bottom=0.13)
+    top_frac = min(0.93, max(0.84, 1.0 - 0.58 / fig_h))
+    bot_frac = max(0.05, min(0.14, 0.58 / fig_h))
+    fig.subplots_adjust(left=0.28, right=0.67, top=top_frac, bottom=bot_frac)
     _style_axes(ax, grid_axis="x")
 
     y_positions = np.arange(n_rows, dtype=np.float64)[::-1]
@@ -570,7 +572,7 @@ def plot_paired_forest(
     ax.set_xlabel(
         f"Paired Difference Δ (Neural DBN − Baseline) in {metric} [{unit_lbl}]  ({dir_note})",
         fontsize=9.0,
-        fontweight="semibold",
+        fontweight="bold",
         color="#0f172a",
     )
     ax.set_title(
@@ -639,9 +641,9 @@ def plot_ablation_breakdown(
         (third_metric, third_label, "(c) Structural Temporal Stability"),
     )
 
-    fig = Figure(figsize=(14.0, 4.9), dpi=dpi)
+    fig = Figure(figsize=(14.0, 5.0), dpi=dpi)
     axes = fig.subplots(1, 3)
-    fig.subplots_adjust(wspace=0.25, top=0.80, bottom=0.20, left=0.06, right=0.98)
+    fig.subplots_adjust(wspace=0.26, top=0.79, bottom=0.19, left=0.06, right=0.98)
 
     n_scen = len(ablation_scens)
     n_pol = len(present_ablations)
@@ -652,6 +654,8 @@ def plot_ablation_breakdown(
     for ax_idx, (m_key, y_lbl, p_title) in enumerate(panels):
         ax = axes[ax_idx]
         _style_axes(ax, grid_axis="y")
+        scen_maxes: list[float] = [0.0 for _ in range(n_scen)]
+        global_hi = 0.0
         for p_idx, pol in enumerate(present_ablations):
             offset = (p_idx - 0.5 * (n_pol - 1)) * bar_w
             xs: list[float] = []
@@ -667,6 +671,8 @@ def plot_ablation_breakdown(
                 means.append(mv)
                 elo.append(max(0.0, mv - lv))
                 ehi.append(max(0.0, hv - mv))
+                scen_maxes[s_idx] = max(scen_maxes[s_idx], hv)
+                global_hi = max(global_hi, hv)
             if not xs:
                 continue
             is_full = pol == "neural_dbn"
@@ -696,13 +702,26 @@ def plot_ablation_breakdown(
             [sid.replace("grid", "").replace("osm_", "").replace("_", "\n") for sid in ablation_scens],
             fontsize=8.0,
         )
-        ax.set_ylabel(y_lbl, fontsize=8.8, fontweight="semibold")
+        pos_maxes = [v for v in scen_maxes if v > 0.5]
+        if (
+            m_key == "spillback_corridor_seconds"
+            and len(pos_maxes) >= 2
+            and max(pos_maxes) / min(pos_maxes) > 20.0
+        ):
+            ax.set_yscale("symlog", linthresh=25.0)
+            ticks = [t for t in (0, 10, 25, 100, 500, 2000) if t <= global_hi * 1.35]
+            ax.set_yticks(ticks)
+            ax.get_yaxis().set_major_formatter(mticker.ScalarFormatter())
+            ax.set_ylim(bottom=0.0, top=global_hi * 1.28)
+            ax.set_ylabel("Spillback Exposure [corridor · s, symlog]", fontsize=8.6, fontweight="bold")
+        else:
+            ax.set_ylabel(y_lbl, fontsize=8.8, fontweight="bold")
+            ax.set_ylim(bottom=0.0)
         ax.set_title(p_title, loc="left", fontsize=9.6, fontweight="bold")
-        ax.set_ylim(bottom=0.0)
 
     axes[0].legend(
         loc="upper center",
-        bbox_to_anchor=(1.72, 1.26),
+        bbox_to_anchor=(1.70, 1.24),
         ncol=min(5, n_pol),
         frameon=True,
         facecolor="#ffffff",
@@ -714,7 +733,7 @@ def plot_ablation_breakdown(
         fontsize=11.2,
         fontweight="bold",
         color="#0f172a",
-        y=0.97,
+        y=1.01,
     )
     return _save_figure_atomic(fig, output_path, dpi=dpi)
 
@@ -944,15 +963,15 @@ def plot_calibration_and_roc_pr(
         ax_roc.plot([0.0, 1.0], [0.0, 1.0], "--", color="#94a3b8", linewidth=1.1, label="Random Chance")
         ax_roc.set_xlim(-0.02, 1.02)
         ax_roc.set_ylim(-0.02, 1.03)
-        ax_roc.set_xlabel("False Positive Rate", fontsize=8.8, fontweight="semibold")
-        ax_roc.set_ylabel("True Positive Rate", fontsize=8.8, fontweight="semibold")
+        ax_roc.set_xlabel("False Positive Rate", fontsize=8.8, fontweight="bold")
+        ax_roc.set_ylabel("True Positive Rate", fontsize=8.8, fontweight="bold")
         ax_roc.set_title("(a) ROC Curves (ID & Zero-Shot OOD)", loc="left", fontsize=9.6, fontweight="bold")
         ax_roc.legend(loc="lower right", fontsize=7.8, frameon=True)
 
         ax_pr.set_xlim(-0.02, 1.02)
         ax_pr.set_ylim(0.0, 1.04)
-        ax_pr.set_xlabel("Recall", fontsize=8.8, fontweight="semibold")
-        ax_pr.set_ylabel("Precision", fontsize=8.8, fontweight="semibold")
+        ax_pr.set_xlabel("Recall", fontsize=8.8, fontweight="bold")
+        ax_pr.set_ylabel("Precision", fontsize=8.8, fontweight="bold")
         ax_pr.set_title("(b) Precision-Recall Curves", loc="left", fontsize=9.6, fontweight="bold")
         ax_pr.legend(loc="lower left", fontsize=7.8, frameon=True)
     elif scalar_summary:
@@ -962,14 +981,14 @@ def plot_calibration_and_roc_pr(
         ax_roc.set_xticks(xs)
         ax_roc.set_xticklabels(names, fontsize=8.0)
         ax_roc.set_ylim(0.0, 1.05)
-        ax_roc.set_ylabel("ROC-AUC", fontsize=8.8, fontweight="semibold")
+        ax_roc.set_ylabel("ROC-AUC", fontsize=8.8, fontweight="bold")
         ax_roc.set_title("(a) Held-Out ROC-AUC", loc="left", fontsize=9.6, fontweight="bold")
 
         ax_pr.bar(xs, [t[2] for t in scalar_summary], width=0.52, color="#009e73")
         ax_pr.set_xticks(xs)
         ax_pr.set_xticklabels(names, fontsize=8.0)
         ax_pr.set_ylim(0.0, 1.05)
-        ax_pr.set_ylabel("PR-AUC", fontsize=8.8, fontweight="semibold")
+        ax_pr.set_ylabel("PR-AUC", fontsize=8.8, fontweight="bold")
         ax_pr.set_title("(b) Held-Out PR-AUC", loc="left", fontsize=9.6, fontweight="bold")
     else:
         raise ConfigValidationError(
@@ -980,8 +999,8 @@ def plot_calibration_and_roc_pr(
         ax_cal.plot([0.0, 1.0], [0.0, 1.0], "--", color="#64748b", linewidth=1.1, label="Perfect Calibration")
         ax_cal.set_xlim(-0.02, 1.02)
         ax_cal.set_ylim(-0.02, 1.03)
-        ax_cal.set_xlabel("Mean Predicted Probability", fontsize=8.8, fontweight="semibold")
-        ax_cal.set_ylabel("Empirical Positive Frequency", fontsize=8.8, fontweight="semibold")
+        ax_cal.set_xlabel("Mean Predicted Probability", fontsize=8.8, fontweight="bold")
+        ax_cal.set_ylabel("Empirical Positive Frequency", fontsize=8.8, fontweight="bold")
         ax_cal.set_title("(c) 10-Bin Reliability (Pre vs Post T_cal)", loc="left", fontsize=9.6, fontweight="bold")
         ax_cal.legend(loc="upper left", fontsize=7.8, frameon=True)
     elif scalar_summary:
@@ -991,7 +1010,7 @@ def plot_calibration_and_roc_pr(
         ax_cal.bar(xs + 0.17, [t[4] for t in scalar_summary], width=0.32, color="#0b3c5d", label="Post-T_cal ECE")
         ax_cal.set_xticks(xs)
         ax_cal.set_xticklabels(names, fontsize=8.0)
-        ax_cal.set_ylabel("10-Bin ECE (Lower is Better)", fontsize=8.8, fontweight="semibold")
+        ax_cal.set_ylabel("10-Bin ECE (Lower is Better)", fontsize=8.8, fontweight="bold")
         ax_cal.set_title("(c) Temperature Scaling Calibration", loc="left", fontsize=9.6, fontweight="bold")
         ax_cal.legend(loc="upper right", fontsize=7.8, frameon=True)
     else:
@@ -1167,8 +1186,8 @@ def plot_latency_scaling(
     sorted_ticks = sorted(all_ns)
     ax.set_xticks(sorted_ticks)
     ax.get_xaxis().set_major_formatter(mticker.ScalarFormatter())
-    ax.set_xlabel("Active Swarm Size N [vehicles]", fontsize=9.2, fontweight="semibold")
-    ax.set_ylabel("CPU DBN Structure + Inference Latency [ms]", fontsize=9.2, fontweight="semibold")
+    ax.set_xlabel("Active Swarm Size N [vehicles]", fontsize=9.2, fontweight="bold")
+    ax.set_ylabel("CPU DBN Structure + Inference Latency [ms]", fontsize=9.2, fontweight="bold")
     ax.set_title(
         "Log-Log Online DBN Update & Inference Latency Scaling (Median, IQR Band, Dotted p95)",
         loc="left",

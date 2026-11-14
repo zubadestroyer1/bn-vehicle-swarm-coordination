@@ -3,445 +3,1169 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
 <title>{{PAGE_TITLE}}</title>
 <style>
-  :root {
-    --bg-deep: #070b12;
-    --panel-bg: rgba(12, 18, 30, 0.84);
-    --panel-border: rgba(148, 163, 184, 0.20);
-    --text-main: #f1f5f9;
-    --text-muted: #94a3b8;
-    --accent-cyan: #38bdf8;
-    --accent-rose: #fb7185;
-    --accent-amber: #fbbf24;
-    --accent-emerald: #34d399;
+  @layer base, hud, states;
+
+  @layer base {
+    :root {
+      color-scheme: dark;
+      --bg-obsidian: #070b12;
+      --glass-bg: rgba(10, 15, 26, 0.72);
+      --glass-bg-strong: rgba(10, 15, 26, 0.80);
+      --glass-border: rgba(255, 255, 255, 0.10);
+      --glass-highlight: rgba(255, 255, 255, 0.07);
+      --glass-shadow: 0 12px 32px rgba(2, 6, 16, 0.54), inset 0 1px 0 var(--glass-highlight);
+      --hairline-split: rgba(255, 255, 255, 0.10);
+
+      --text-primary: #f8fafc;
+      --text-secondary: #cbd5e1;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+
+      --accent-cyan: #22d3ee;
+      --accent-sky: #38bdf8;
+      --accent-amber: #f59e0b;
+      --accent-gold: #fbbf24;
+      --accent-emerald: #34d399;
+      --accent-rose: #fb7185;
+
+      --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", system-ui, sans-serif;
+      --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    }
+
+    :where(html, body, main, section, header, footer, div, span, h1, h2, p, button, input, canvas, svg) {
+      box-sizing: border-box;
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      inline-size: 100%;
+      block-size: 100%;
+      overflow: hidden;
+      background: var(--bg-obsidian);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      line-height: 1.35;
+      text-align: start;
+      -webkit-font-smoothing: antialiased;
+      user-select: none;
+    }
+
+    .visually-hidden:where(:not(:focus-within, :active)) {
+      position: absolute !important;
+      clip-path: inset(50%) !important;
+      overflow: hidden !important;
+      inline-size: 1px !important;
+      block-size: 1px !important;
+      margin: -1px !important;
+      padding: 0 !important;
+      border: 0 !important;
+      white-space: nowrap !important;
+    }
   }
-  * { box-sizing: border-box; }
-  html, body {
-    margin: 0;
-    padding: 0;
-    width: 100%;
-    height: 100%;
-    overflow: hidden;
-    background: var(--bg-deep);
-    color: var(--text-main);
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
-    font-size: 13px;
-    user-select: none;
+
+  @layer hud {
+    /* 1. Full-Bleed 3D Stage (100vw x 100vh) */
+    #viewport-grid {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      inline-size: 100vw;
+      block-size: 100vh;
+      block-size: 100dvh;
+      background: var(--bg-obsidian);
+      z-index: 1;
+    }
+
+    #viewport-grid[data-layout="split"] {
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    }
+
+    #viewport-grid:is([data-layout="primary"], [data-layout="compare"], [data-layout="single"]) {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    #viewport-grid[data-layout="primary"] #pane-compare {
+      display: none;
+    }
+
+    #viewport-grid[data-layout="compare"] #pane-primary {
+      display: none;
+    }
+
+    .vp-pane {
+      position: relative;
+      inline-size: 100%;
+      block-size: 100%;
+      min-inline-size: 0;
+      min-block-size: 0;
+      overflow: hidden;
+    }
+
+    #viewport-grid[data-layout="split"] #pane-compare {
+      border-inline-start: 1px solid var(--hairline-split);
+    }
+
+    .vp-canvas {
+      display: block;
+      inline-size: 100%;
+      block-size: 100%;
+      cursor: grab;
+      touch-action: none;
+    }
+
+    .vp-canvas:active {
+      cursor: grabbing;
+    }
+
+    /* Shared Glassmorphic Surface */
+    .glass-surface {
+      background: var(--glass-bg);
+      -webkit-backdrop-filter: blur(20px) saturate(160%);
+      backdrop-filter: blur(20px) saturate(160%);
+      border: 1px solid var(--glass-border);
+      box-shadow: var(--glass-shadow);
+    }
+
+    /* 2A. Element A — Top Center Floating Pill */
+    #top-hud-wrap {
+      position: fixed;
+      inset-block-start: 0.875rem;
+      inset-inline: 0;
+      display: flex;
+      justify-content: center;
+      padding-inline: 0.75rem;
+      pointer-events: none;
+      z-index: 30;
+    }
+
+    #top-hud {
+      pointer-events: auto;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4375rem;
+      min-block-size: 2.5rem;
+      max-inline-size: calc(100vw - 1.5rem);
+      padding-block: 0.25rem;
+      padding-inline: 0.875rem 0.3125rem;
+      border-radius: 999px;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+
+    #top-hud::-webkit-scrollbar {
+      display: none;
+    }
+
+    .scenario-brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding-inline-end: 0.1875rem;
+      flex-shrink: 0;
+    }
+
+    .brand-pulse {
+      inline-size: 0.4375rem;
+      block-size: 0.4375rem;
+      border-radius: 50%;
+      background: var(--accent-cyan);
+      box-shadow: 0 0 10px rgba(34, 211, 238, 0.85);
+      flex-shrink: 0;
+    }
+
+    #scenario-title {
+      font-size: 0.8125rem;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      color: var(--text-primary);
+      white-space: nowrap;
+    }
+
+    .hud-sep {
+      display: inline-block;
+      block-size: 1.125rem;
+      border-inline-start: 1px solid rgba(255, 255, 255, 0.11);
+      flex-shrink: 0;
+    }
+
+    .seg-capsule {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.125rem;
+      padding: 0.125rem;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.045);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      flex-shrink: 0;
+    }
+
+    button {
+      appearance: none;
+      font-family: inherit;
+      font-size: 0.75rem;
+      font-weight: 560;
+      line-height: 1.2;
+      color: var(--text-secondary);
+      background: transparent;
+      border: 1px solid transparent;
+      cursor: pointer;
+      padding-block: 0.25rem;
+      padding-inline: 0.625rem;
+      min-inline-size: 1.75rem;
+      min-block-size: 1.75rem;
+      border-radius: 999px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.3125rem;
+      white-space: nowrap;
+    }
+
+    .seg-btn {
+      color: var(--text-muted);
+    }
+
+    #layout-group .seg-btn.active {
+      background: rgba(56, 189, 248, 0.20);
+      color: #f0f9ff;
+      border-color: rgba(56, 189, 248, 0.42);
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.28);
+    }
+
+    #camera-group .seg-btn.active {
+      background: rgba(255, 255, 255, 0.14);
+      color: var(--text-primary);
+      border-color: rgba(255, 255, 255, 0.22);
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.28);
+    }
+
+    .icon-btn {
+      padding: 0;
+      min-inline-size: 1.875rem;
+      min-block-size: 1.875rem;
+      color: var(--text-secondary);
+      background: rgba(255, 255, 255, 0.05);
+      border-color: rgba(255, 255, 255, 0.08);
+      flex-shrink: 0;
+    }
+
+    .icon-btn svg {
+      inline-size: 0.9375rem;
+      block-size: 0.9375rem;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 1.85;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    /* 2B. Element B — Compact Corner Scorecards (252px, zero overlap below #top-hud) */
+    .scorecard {
+      position: absolute;
+      inset-block-start: 4.125rem;
+      inset-inline-start: 1rem;
+      inline-size: 15.75rem;
+      max-inline-size: calc(100% - 2rem);
+      padding: 0.6875rem 0.8125rem;
+      border-radius: 0.875rem;
+      pointer-events: none;
+      z-index: 20;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+
+    .sc-head {
+      display: flex;
+      flex-direction: column;
+      gap: 0.3125rem;
+    }
+
+    .sc-policy-row {
+      display: flex;
+      align-items: center;
+      gap: 0.4375rem;
+      min-inline-size: 0;
+    }
+
+    .status-dot {
+      inline-size: 0.5rem;
+      block-size: 0.5rem;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .status-dot--primary {
+      background: var(--accent-cyan);
+      box-shadow: 0 0 10px rgba(34, 211, 238, 0.85);
+    }
+
+    .status-dot--compare {
+      background: var(--accent-amber);
+      box-shadow: 0 0 8px rgba(245, 158, 11, 0.65);
+    }
+
+    .sc-title {
+      margin: 0;
+      font-size: 0.8125rem;
+      font-weight: 650;
+      letter-spacing: -0.01em;
+      color: var(--text-primary);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .sc-badge {
+      align-self: flex-start;
+      display: inline-flex;
+      align-items: center;
+      min-block-size: 1.25rem;
+      padding-block: 0.0625rem;
+      padding-inline: 0.4375rem;
+      border-radius: 999px;
+      font-size: 0.6875rem;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -0.005em;
+      white-space: nowrap;
+    }
+
+    #badge-delta {
+      background: rgba(16, 185, 129, 0.16);
+      border: 1px solid rgba(52, 211, 153, 0.36);
+      color: #6ee7b7;
+    }
+
+    #badge-baseline {
+      background: rgba(148, 163, 184, 0.11);
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      color: var(--text-muted);
+      font-weight: 520;
+    }
+
+    .sc-kpis {
+      display: grid;
+      grid-template-columns: 1fr 1.18fr 0.92fr;
+      gap: 0.5rem;
+      padding-block: 0.4375rem;
+      border-block: 1px solid rgba(255, 255, 255, 0.08);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .kpi-cell {
+      display: flex;
+      flex-direction: column;
+      gap: 0.125rem;
+      min-inline-size: 0;
+    }
+
+    .kpi-label {
+      font-size: 0.625rem;
+      font-weight: 540;
+      color: var(--text-muted);
+      letter-spacing: 0.01em;
+      white-space: nowrap;
+    }
+
+    .kpi-val {
+      font-size: 0.875rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--text-primary);
+      white-space: nowrap;
+    }
+
+    #scorecard-primary #kpi-p-spill {
+      color: #67e8f9;
+    }
+
+    #scorecard-compare #kpi-c-spill {
+      color: #fcd34d;
+    }
+
+    .sc-foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.375rem;
+      font-size: 0.6875rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .safety-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.25rem;
+      padding-block: 0.0625rem;
+      padding-inline: 0.4375rem;
+      border-radius: 999px;
+      background: rgba(16, 185, 129, 0.11);
+      border: 1px solid rgba(52, 211, 153, 0.24);
+      color: #a7f3d0;
+      font-weight: 560;
+      white-space: nowrap;
+    }
+
+    .safety-pill::before {
+      content: "";
+      inline-size: 0.3125rem;
+      block-size: 0.3125rem;
+      border-radius: 50%;
+      background: var(--accent-emerald);
+    }
+
+    .live-stat {
+      color: var(--text-muted);
+      font-size: 0.6875rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* Dismissible Floating Vehicle Chip (top-right, hidden until vehicle picked) */
+    #vehicle-chip {
+      position: fixed;
+      inset-block-start: 4.125rem;
+      inset-inline-end: 1rem;
+      z-index: 25;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      min-block-size: 2.25rem;
+      padding-block: 0.25rem;
+      padding-inline: 0.6875rem 0.3125rem;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-variant-numeric: tabular-nums;
+      pointer-events: auto;
+    }
+
+    #chip-id {
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      font-weight: 650;
+      color: var(--text-primary);
+    }
+
+    #chip-mode {
+      display: inline-flex;
+      align-items: center;
+      padding-block: 0.125rem;
+      padding-inline: 0.4375rem;
+      border-radius: 999px;
+      font-size: 0.6875rem;
+      font-weight: 620;
+      background: rgba(34, 211, 238, 0.16);
+      border: 1px solid rgba(34, 211, 238, 0.38);
+      color: #a5f3fc;
+    }
+
+    #chip-mode[data-mode="eco-glide"] {
+      background: rgba(251, 191, 36, 0.16);
+      border-color: rgba(251, 191, 36, 0.38);
+      color: #fde68a;
+    }
+
+    #chip-mode[data-mode="yield"] {
+      background: rgba(251, 113, 133, 0.16);
+      border-color: rgba(251, 113, 133, 0.38);
+      color: #fecdd3;
+    }
+
+    #chip-mode:is([data-mode="cruise"], [data-mode="signal"]) {
+      background: rgba(148, 163, 184, 0.16);
+      border-color: rgba(148, 163, 184, 0.34);
+      color: var(--text-secondary);
+    }
+
+    .chip-metric {
+      color: var(--text-secondary);
+      font-weight: 540;
+    }
+
+    #chip-delay {
+      color: var(--text-muted);
+    }
+
+    #chip-close {
+      padding: 0;
+      min-inline-size: 1.5rem;
+      min-block-size: 1.5rem;
+      color: var(--text-muted);
+      background: rgba(255, 255, 255, 0.06);
+    }
+
+    #chip-close svg {
+      inline-size: 0.75rem;
+      block-size: 0.75rem;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+    }
+
+    /* 2C. Element C — Bottom Center Floating Playback Bar (max-width: 660px, bottom: 20px) */
+    #bottom-hud-wrap {
+      position: fixed;
+      inset-block-end: 1.25rem;
+      inset-inline: 0;
+      display: flex;
+      justify-content: center;
+      padding-inline: 0.75rem;
+      pointer-events: none;
+      z-index: 30;
+    }
+
+    #playback-bar {
+      pointer-events: auto;
+      inline-size: min(40rem, calc(100vw - 1.5rem));
+      max-inline-size: 41.25rem;
+      padding-block: 0.4375rem 0.5rem;
+      padding-inline: 0.75rem;
+      border-radius: 1.125rem;
+      background: var(--glass-bg-strong);
+      display: flex;
+      flex-direction: column;
+      gap: 0.3125rem;
+    }
+
+    .pb-transport {
+      display: flex;
+      align-items: center;
+      gap: 0.625rem;
+    }
+
+    #btn-play {
+      padding: 0;
+      min-inline-size: 2rem;
+      min-block-size: 2rem;
+      border-radius: 999px;
+      background: rgba(56, 189, 248, 0.20);
+      border-color: rgba(56, 189, 248, 0.45);
+      color: #e0f2fe;
+      flex-shrink: 0;
+    }
+
+    #btn-play svg {
+      inline-size: 0.875rem;
+      block-size: 0.875rem;
+      fill: currentColor;
+    }
+
+    #btn-play[data-playing="true"] .icon-play {
+      display: none;
+    }
+
+    #btn-play:not([data-playing="true"]) .icon-pause {
+      display: none;
+    }
+
+    #time-readout {
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+      color: var(--text-secondary);
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    .scrubber-wrap {
+      position: relative;
+      flex: 1 1 auto;
+      min-inline-size: 5rem;
+      display: flex;
+      align-items: center;
+    }
+
+    #incident-window {
+      position: absolute;
+      inset-block-start: 50%;
+      translate: 0 -50%;
+      block-size: 0.25rem;
+      border-radius: 999px;
+      background: rgba(251, 191, 36, 0.42);
+      box-shadow: 0 0 8px rgba(251, 191, 36, 0.35);
+      pointer-events: none;
+      z-index: 1;
+    }
+
+    /* Native Accessible Range Slider with Cross-Browser Track & Progress */
+    #timeline-slider {
+      --slider-track-size: 0.25rem;
+      --slider-thumb-size: 0.8125rem;
+      --slider-track-radius: 999px;
+      --slider-thumb-radius: 50%;
+      --slider-track-color: rgba(255, 255, 255, 0.16);
+      --slider-fill-color: var(--accent-sky);
+      --slider-thumb-color: #f8fafc;
+      --slider-direction: to right;
+      --attr-min: 0;
+      --attr-max: 1000;
+      --control-value: 0;
+      --slider-progress: calc(
+        progress(var(--control-value), var(--attr-min), var(--attr-max)) * 100%
+      );
+
+      position: relative;
+      z-index: 2;
+      appearance: none;
+      inline-size: 100%;
+      block-size: 1.625rem;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      cursor: pointer;
+    }
+
+    #timeline-slider:dir(rtl) {
+      --slider-direction: to left;
+    }
+
+    @supports not (opacity: progress(1, 0, 100)) {
+      #timeline-slider {
+        --slider-progress: calc(
+          (var(--control-value) - var(--attr-min)) /
+          (var(--attr-max) - var(--attr-min)) * 100%
+        );
+      }
+    }
+
+    #timeline-slider::-webkit-slider-runnable-track {
+      block-size: var(--slider-track-size);
+      border: 0;
+      border-radius: var(--slider-track-radius);
+      background: linear-gradient(
+        var(--slider-direction),
+        var(--slider-fill-color) var(--slider-progress),
+        var(--slider-track-color) var(--slider-progress)
+      );
+    }
+
+    #timeline-slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      inline-size: var(--slider-thumb-size);
+      block-size: var(--slider-thumb-size);
+      margin-block-start: calc((var(--slider-track-size) - var(--slider-thumb-size)) / 2);
+      border: 0;
+      border-radius: var(--slider-thumb-radius);
+      background: var(--slider-thumb-color);
+      box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.45), 0 1px 4px rgba(0, 0, 0, 0.5);
+    }
+
+    #timeline-slider::-moz-range-track {
+      block-size: var(--slider-track-size);
+      border: 0;
+      border-radius: var(--slider-track-radius);
+      background: var(--slider-track-color);
+    }
+
+    #timeline-slider::-moz-range-progress {
+      block-size: var(--slider-track-size);
+      border-radius: var(--slider-track-radius);
+      background: var(--slider-fill-color);
+    }
+
+    #timeline-slider::-moz-range-thumb {
+      inline-size: var(--slider-thumb-size);
+      block-size: var(--slider-thumb-size);
+      border: 0;
+      border-radius: var(--slider-thumb-radius);
+      background: var(--slider-thumb-color);
+      box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.45), 0 1px 4px rgba(0, 0, 0, 0.5);
+    }
+
+    #btn-speed {
+      min-inline-size: 2.375rem;
+      min-block-size: 1.625rem;
+      padding-inline: 0.5rem;
+      font-variant-numeric: tabular-nums;
+      font-weight: 650;
+      background: rgba(255, 255, 255, 0.06);
+      border-color: rgba(255, 255, 255, 0.11);
+      color: var(--text-primary);
+      flex-shrink: 0;
+    }
+
+    .pb-layers {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+
+    .arcs-cluster {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      min-inline-size: 0;
+      flex-wrap: wrap;
+    }
+
+    .pill-toggle {
+      min-block-size: 1.5625rem;
+      padding-block: 0.1875rem;
+      padding-inline: 0.5625rem;
+      font-size: 0.6875rem;
+      font-weight: 580;
+      background: rgba(255, 255, 255, 0.045);
+      border-color: rgba(255, 255, 255, 0.10);
+      color: var(--text-muted);
+    }
+
+    .pill-toggle::before {
+      content: "";
+      inline-size: 0.375rem;
+      block-size: 0.375rem;
+      border-radius: 50%;
+      background: var(--text-dim);
+    }
+
+    .pill-toggle.active {
+      background: rgba(56, 189, 248, 0.15);
+      border-color: rgba(56, 189, 248, 0.36);
+      color: #e0f2fe;
+    }
+
+    .pill-toggle.active::before {
+      background: var(--accent-cyan);
+      box-shadow: 0 0 6px rgba(34, 211, 238, 0.8);
+    }
+
+    #arcs-legend {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.6875rem;
+      color: var(--text-muted);
+      padding-inline: 0.25rem;
+    }
+
+    #toggle-arcs:not(.active) + #arcs-legend {
+      display: none;
+    }
+
+    .leg-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.25rem;
+      white-space: nowrap;
+    }
+
+    .leg-dot {
+      inline-size: 0.375rem;
+      block-size: 0.375rem;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .leg-dot--corridor { background: var(--accent-sky); box-shadow: 0 0 5px rgba(56, 189, 248, 0.7); }
+    .leg-dot--conflict { background: var(--accent-rose); box-shadow: 0 0 5px rgba(251, 113, 133, 0.7); }
+    .leg-dot--spillback { background: var(--accent-gold); box-shadow: 0 0 5px rgba(251, 191, 36, 0.7); }
+    .leg-dot--wave { background: var(--accent-emerald); box-shadow: 0 0 5px rgba(52, 211, 153, 0.7); }
+
+    /* 3. Polished Boot & Error Overlays */
+    #loading-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 60;
+      display: grid;
+      place-items: center;
+      background: radial-gradient(circle at 50% 42%, #0e1628 0%, #060911 76%);
+      opacity: 1;
+      visibility: visible;
+    }
+
+    #loading-overlay:is([hidden], .is-hidden, .hidden) {
+      display: grid;
+      opacity: 0;
+      visibility: hidden;
+      pointer-events: none;
+    }
+
+    .boot-card {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 1.5rem 2rem;
+      text-align: center;
+    }
+
+    .boot-ring {
+      inline-size: 1.875rem;
+      block-size: 1.875rem;
+      border-radius: 50%;
+      border: 2px solid rgba(56, 189, 248, 0.18);
+      border-block-start-color: var(--accent-cyan);
+    }
+
+    .boot-title {
+      font-size: 0.875rem;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      color: var(--text-primary);
+    }
+
+    #loading-status {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      font-variant-numeric: tabular-nums;
+    }
+
+    #error-banner {
+      position: fixed;
+      inset-block-start: 50%;
+      inset-inline-start: 50%;
+      translate: -50% -50%;
+      z-index: 75;
+      inline-size: min(28rem, calc(100vw - 2rem));
+      padding: 1.125rem 1.25rem;
+      border-radius: 0.875rem;
+      background: rgba(28, 10, 16, 0.94);
+      border: 1px solid rgba(244, 63, 94, 0.48);
+      box-shadow: 0 18px 42px rgba(0, 0, 0, 0.65);
+      color: #ffe4e6;
+    }
+
+    .err-heading {
+      font-size: 0.875rem;
+      font-weight: 650;
+      color: #fda4af;
+      margin-block-end: 0.375rem;
+    }
+
+    #error-message {
+      margin: 0;
+      font-size: 0.78125rem;
+      line-height: 1.45;
+      color: #fecdd3;
+      overflow-wrap: break-word;
+    }
   }
-  #app-shell {
-    display: grid;
-    grid-template-rows: 50px 1fr 70px;
-    width: 100vw;
-    height: 100vh;
-  }
-  /* Top Toolbar */
-  #topbar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0 14px;
-    background: rgba(9, 14, 24, 0.95);
-    border-bottom: 1px solid var(--panel-border);
-    gap: 10px;
-    z-index: 20;
-  }
-  .brand-wrap {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    min-width: 0;
-  }
-  .brand-dot {
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    background: radial-gradient(circle, #38bdf8 10%, #0284c7 90%);
-    box-shadow: 0 0 10px rgba(56, 189, 248, 0.8);
-    flex-shrink: 0;
-  }
-  .brand-title {
-    font-weight: 700;
-    font-size: 14px;
-    letter-spacing: 0.01em;
-    white-space: nowrap;
-  }
-  .pill-badge {
-    display: inline-flex;
-    align-items: center;
-    padding: 3px 9px;
-    border-radius: 999px;
-    font-size: 11.5px;
-    font-weight: 600;
-    background: rgba(56, 189, 248, 0.14);
-    border: 1px solid rgba(56, 189, 248, 0.35);
-    color: #bae6fd;
-    white-space: nowrap;
-  }
-  #badge-delta {
-    display: none;
-    background: rgba(52, 211, 153, 0.14);
-    border-color: rgba(52, 211, 153, 0.38);
-    color: #a7f3d0;
-  }
-  .toolbar-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: nowrap;
-  }
-  .seg-group {
-    display: inline-flex;
-    background: rgba(15, 23, 42, 0.85);
-    border: 1px solid var(--panel-border);
-    border-radius: 7px;
-    padding: 2px;
-    gap: 2px;
-  }
-  button, select {
-    background: rgba(30, 41, 59, 0.85);
-    color: var(--text-main);
-    border: 1px solid var(--panel-border);
-    border-radius: 6px;
-    padding: 5px 10px;
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.14s ease, border-color 0.14s ease;
-  }
-  button:hover, select:hover {
-    background: rgba(51, 65, 85, 0.92);
-    border-color: rgba(148, 163, 184, 0.42);
-  }
-  .seg-group button {
-    border: none;
-    background: transparent;
-    padding: 4px 9px;
-  }
-  .seg-group button.active {
-    background: rgba(56, 189, 248, 0.22);
-    color: #e0f2fe;
-    box-shadow: inset 0 0 0 1px rgba(56, 189, 248, 0.48);
-  }
-  #btn-export-png {
-    background: rgba(14, 116, 144, 0.55);
-    border-color: rgba(56, 189, 248, 0.45);
-  }
-  /* Main Stage & Dual Viewports */
-  #main-area {
-    position: relative;
-    width: 100%;
-    height: 100%;
-    overflow: hidden;
-  }
-  #viewport-stage {
-    display: grid;
-    width: 100%;
-    height: 100%;
-    gap: 4px;
-    background: #04070d;
-  }
-  #viewport-stage[data-layout="split"] {
-    grid-template-columns: 1fr 1fr;
-  }
-  #viewport-stage[data-layout="single"] {
-    grid-template-columns: 1fr;
-  }
-  .vp-pane {
-    position: relative;
-    display: flex;
-    flex-direction: column;
-    width: 100%;
-    height: 100%;
-    min-width: 0;
-    min-height: 0;
-  }
-  .vp-canvas {
-    width: 100%;
-    height: 100%;
-    display: block;
-    cursor: grab;
-  }
-  .vp-canvas:active {
-    cursor: grabbing;
-  }
-  .vp-hud {
-    position: absolute;
-    top: 10px;
-    left: 10px;
-    padding: 8px 11px;
-    border-radius: 9px;
-    background: var(--panel-bg);
-    border: 1px solid var(--panel-border);
-    backdrop-filter: blur(10px);
-    pointer-events: none;
-    max-width: calc(100% - 24px);
-  }
-  .vp-title {
-    font-weight: 700;
-    font-size: 12.5px;
-    margin-bottom: 5px;
-    color: #e2e8f0;
-  }
-  #pane-compare .vp-title { color: #fda4af; }
-  #pane-primary .vp-title { color: #7dd3fc; }
-  .kpi-row {
-    display: flex;
-    gap: 12px;
-    flex-wrap: wrap;
-    font-size: 11.5px;
-    font-variant-numeric: tabular-nums;
-  }
-  .kpi-row span { color: var(--text-muted); }
-  .kpi-row b { color: var(--text-main); margin-left: 3px; }
-  /* Side Control & Inspector Drawer */
-  #side-drawer {
-    position: absolute;
-    top: 10px;
-    right: 10px;
-    width: 292px;
-    max-height: calc(100% - 20px);
-    overflow-y: auto;
-    padding: 11px 12px;
-    border-radius: 10px;
-    background: var(--panel-bg);
-    border: 1px solid var(--panel-border);
-    backdrop-filter: blur(12px);
-    z-index: 15;
-  }
-  .drawer-sec {
-    margin-bottom: 11px;
-    padding-bottom: 10px;
-    border-bottom: 1px solid rgba(148, 163, 184, 0.14);
-  }
-  .drawer-sec:last-child {
-    margin-bottom: 0;
-    padding-bottom: 0;
-    border-bottom: none;
-  }
-  .sec-head {
-    font-size: 11px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--text-muted);
-    margin-bottom: 7px;
-  }
-  .ctrl-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin: 5px 0;
-    font-size: 12px;
-  }
-  .chk-list label {
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    margin: 4px 0;
-    font-size: 12px;
-    cursor: pointer;
-  }
-  .swatch {
-    width: 10px;
-    height: 10px;
-    border-radius: 3px;
-    display: inline-block;
-  }
-  .insp-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 5px 8px;
-    font-size: 11.5px;
-    font-variant-numeric: tabular-nums;
-  }
-  .insp-grid span {
-    display: block;
-    font-size: 10.5px;
-    color: var(--text-muted);
-  }
-  .insp-sub {
-    margin-top: 6px;
-    font-size: 11px;
-    color: #cbd5e1;
-  }
-  .edge-pill {
-    margin-top: 3px;
-    padding: 2px 6px;
-    border-radius: 4px;
-    background: rgba(30, 41, 59, 0.72);
-    font-variant-numeric: tabular-nums;
-  }
-  .muted {
-    color: var(--text-muted);
-    font-size: 11.5px;
-    line-height: 1.4;
-  }
-  /* Bottom Timeline Scrubber & Sparkline */
-  #bottombar {
-    display: grid;
-    grid-template-columns: auto 100px 90px 1fr 220px;
-    align-items: center;
-    gap: 12px;
-    padding: 8px 14px;
-    background: rgba(9, 14, 24, 0.96);
-    border-top: 1px solid var(--panel-border);
-    z-index: 20;
-  }
-  #lbl-clock {
-    font-family: ui-monospace, "SF Mono", Menlo, monospace;
-    font-weight: 700;
-    font-size: 13px;
-    color: #bae6fd;
-  }
-  #slider-scrub {
-    width: 100%;
-    accent-color: var(--accent-cyan);
-    cursor: pointer;
-  }
-  #sparkline-wrap {
-    display: flex;
-    flex-direction: column;
-    height: 48px;
-    background: rgba(15, 23, 42, 0.8);
-    border: 1px solid var(--panel-border);
-    border-radius: 6px;
-    padding: 3px 6px;
-  }
-  #sparkline-wrap small {
-    font-size: 9.5px;
-    color: var(--text-muted);
-  }
-  #sparkline-canvas {
-    width: 100%;
-    height: 32px;
-    display: block;
+
+  @layer states {
+    :is([hidden], .hidden, .is-hidden):not(#loading-overlay) {
+      display: none;
+    }
+
+    @media (hover: hover) {
+      button:hover:not([aria-disabled="true"]) {
+        color: var(--text-primary);
+        background: rgba(255, 255, 255, 0.09);
+      }
+
+      #layout-group .seg-btn.active:hover {
+        background: rgba(56, 189, 248, 0.26);
+      }
+
+      #camera-group .seg-btn.active:hover {
+        background: rgba(255, 255, 255, 0.19);
+      }
+
+      #btn-play:hover {
+        background: rgba(56, 189, 248, 0.30);
+      }
+    }
+
+    @media (prefers-reduced-motion: no-preference) {
+      button {
+        transition: background-color 140ms ease-out, border-color 140ms ease-out, color 140ms ease-out, scale 120ms ease-out;
+      }
+
+      button:active:not([aria-disabled="true"]) {
+        scale: 0.96;
+      }
+
+      #loading-overlay {
+        transition: opacity 260ms ease-out, visibility 260ms ease-out;
+      }
+
+      .boot-ring {
+        animation: swarm-spin 820ms linear infinite;
+      }
+    }
+
+    @keyframes swarm-spin {
+      to { rotate: 360deg; }
+    }
+
+    :where(button, input):focus-visible {
+      outline: 2px solid var(--accent-cyan);
+      outline-offset: 2px;
+    }
+
+    #timeline-slider:focus-visible {
+      outline: 2px solid var(--accent-cyan);
+      outline-offset: 4px;
+      border-radius: 6px;
+    }
+
+    @media (pointer: coarse) {
+      button {
+        min-inline-size: 2.25rem;
+        min-block-size: 2.25rem;
+      }
+    }
+
+    @media (max-width: 780px) {
+      .scorecard {
+        inline-size: 12.75rem;
+        padding: 0.5rem 0.625rem;
+      }
+
+      #arcs-legend {
+        display: none;
+      }
+    }
+
+    @media (forced-colors: active) {
+      .seg-btn.active,
+      .pill-toggle.active {
+        outline: 2px solid Highlight;
+      }
+    }
   }
 </style>
 </head>
 <body>
-<div id="app-shell">
-  <header id="topbar">
-    <div class="brand-wrap">
-      <span class="brand-dot"></span>
-      <span class="brand-title">{{PAGE_TITLE}}</span>
-      <span id="badge-network" class="pill-badge">Urban Network</span>
-      <span id="badge-delta" class="pill-badge"></span>
-    </div>
-    <div class="toolbar-actions">
-      <div id="layout-group" class="seg-group">
-        <button type="button" data-layout="split" class="active">Split Compare</button>
-        <button type="button" data-layout="primary">Primary</button>
-        <button type="button" data-layout="compare">Baseline</button>
+  <h1 class="visually-hidden">{{PAGE_TITLE}}</h1>
+
+  <!-- Element A: Top Center Floating Pill -->
+  <header id="top-hud-wrap">
+    <div id="top-hud" class="glass-surface" role="toolbar" focusgroup="toolbar wrap" aria-label="Viewport and camera controls">
+      <div class="scenario-brand">
+        <span class="brand-pulse" aria-hidden="true"></span>
+        <span id="scenario-title">Urban Network</span>
       </div>
-      <div class="seg-group">
-        <button type="button" data-cam="orbit" class="active">3D Orbit</button>
-        <button type="button" data-cam="ortho">Top-Down Ortho</button>
-        <button type="button" data-cam="chase">Chase Follow</button>
+
+      <span class="hud-sep" role="separator" aria-orientation="vertical"></span>
+
+      <div id="layout-group" class="seg-capsule" role="group" aria-label="Comparison layout">
+        <button type="button" data-layout="split" class="seg-btn active" aria-pressed="true">Split</button>
+        <button type="button" data-layout="primary" class="seg-btn" aria-pressed="false">Neural DBN</button>
+        <button type="button" data-layout="compare" class="seg-btn" aria-pressed="false">Baseline</button>
       </div>
-      <button type="button" id="btn-reset-cam">Reset View</button>
-      <button type="button" id="btn-export-png">Export PNG</button>
+
+      <span class="hud-sep" role="separator" aria-orientation="vertical"></span>
+
+      <div id="camera-group" class="seg-capsule" role="group" aria-label="Camera view">
+        <button type="button" data-cam="orbit" class="seg-btn active" aria-pressed="true">3D View</button>
+        <button type="button" data-cam="ortho" class="seg-btn" aria-pressed="false">Top-Down</button>
+        <button type="button" data-cam="chase" class="seg-btn" aria-pressed="false">Follow</button>
+      </div>
+
+      <button type="button" id="btn-export-png" class="icon-btn" title="Export high-res PNG" aria-label="Export high-res PNG">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 3v11m0 0-4-4m4 4 4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
+        </svg>
+      </button>
     </div>
   </header>
 
-  <main id="main-area">
-    <div id="viewport-stage" data-layout="single">
-      <section id="pane-compare" class="vp-pane" style="display:none;">
-        <canvas id="canvas-compare" class="vp-canvas"></canvas>
-        <div class="vp-hud">
-          <div id="title-compare" class="vp-title">Baseline Policy</div>
-          <div class="kpi-row">
-            <div><span>Vehicles:</span><b id="kpi-c-veh">0</b></div>
-            <div><span>Mean Speed:</span><b id="kpi-c-speed">0.0 m/s</b></div>
-            <div><span>Spillbacks:</span><b id="kpi-c-spill">0</b></div>
+  <!-- Full-Bleed 3D Dual Stage -->
+  <main id="viewport-grid" data-layout="split">
+    <section id="pane-primary" class="vp-pane" aria-labelledby="title-primary">
+      <canvas id="canvas-primary" class="vp-canvas"></canvas>
+
+      <!-- Element B (Left): Primary Neural DBN Scorecard -->
+      <div id="scorecard-primary" class="scorecard glass-surface">
+        <div class="sc-head">
+          <div class="sc-policy-row">
+            <span class="status-dot status-dot--primary" aria-hidden="true"></span>
+            <h2 id="title-primary" class="sc-title">Neural DBN Swarm</h2>
+          </div>
+          <span id="badge-delta" class="sc-badge" hidden></span>
+        </div>
+
+        <div class="sc-kpis">
+          <div class="kpi-cell">
+            <span class="kpi-label">Mean Delay</span>
+            <span id="kpi-p-delay" class="kpi-val">--</span>
+          </div>
+          <div class="kpi-cell">
+            <span class="kpi-label">Throughput</span>
+            <span id="kpi-p-throughput" class="kpi-val">--</span>
+          </div>
+          <div class="kpi-cell">
+            <span class="kpi-label">Spillback</span>
+            <span id="kpi-p-spill" class="kpi-val">--</span>
           </div>
         </div>
-      </section>
 
-      <section id="pane-primary" class="vp-pane">
-        <canvas id="canvas-primary" class="vp-canvas"></canvas>
-        <div class="vp-hud">
-          <div id="title-primary" class="vp-title">Neural DBN Swarm Coordinator</div>
-          <div class="kpi-row">
-            <div><span>Vehicles:</span><b id="kpi-p-veh">0</b></div>
-            <div><span>Mean Speed:</span><b id="kpi-p-speed">0.0 m/s</b></div>
-            <div><span>DBN Edges:</span><b id="kpi-p-edges">0</b></div>
-            <div><span>Spillbacks:</span><b id="kpi-p-spill">0</b></div>
-            <div><span>DBN Step:</span><b id="kpi-p-lat">0.00 ms</b></div>
+        <div class="sc-foot">
+          <span id="kpi-p-safety" class="safety-pill">0 Collisions</span>
+          <span id="kpi-p-live" class="live-stat">0 active · 0.0 m/s</span>
+        </div>
+      </div>
+    </section>
+
+    <section id="pane-compare" class="vp-pane" aria-labelledby="title-compare">
+      <canvas id="canvas-compare" class="vp-canvas"></canvas>
+
+      <!-- Element B (Right): Baseline Scorecard -->
+      <div id="scorecard-compare" class="scorecard glass-surface">
+        <div class="sc-head">
+          <div class="sc-policy-row">
+            <span class="status-dot status-dot--compare" aria-hidden="true"></span>
+            <h2 id="title-compare" class="sc-title">Actuated Signals</h2>
+          </div>
+          <span id="badge-baseline" class="sc-badge">Baseline Control</span>
+        </div>
+
+        <div class="sc-kpis">
+          <div class="kpi-cell">
+            <span class="kpi-label">Mean Delay</span>
+            <span id="kpi-c-delay" class="kpi-val">--</span>
+          </div>
+          <div class="kpi-cell">
+            <span class="kpi-label">Throughput</span>
+            <span id="kpi-c-throughput" class="kpi-val">--</span>
+          </div>
+          <div class="kpi-cell">
+            <span class="kpi-label">Spillback</span>
+            <span id="kpi-c-spill" class="kpi-val">--</span>
           </div>
         </div>
-      </section>
-    </div>
 
-    <aside id="side-drawer">
-      <div class="drawer-sec">
-        <div class="sec-head">Vehicle Color &amp; Scene Layers</div>
-        <div class="ctrl-row">
-          <span>Vehicle Color</span>
-          <select id="select-color">
-            <option value="speed">Speed (m/s)</option>
-            <option value="psi">Cascade Priority ψ</option>
-            <option value="uncertainty">Belief Uncertainty σ_s</option>
-            <option value="goal">Destination Corridor</option>
-          </select>
-        </div>
-        <div class="chk-list">
-          <label><input type="checkbox" id="chk-buildings" checked> 3D Urban Buildings</label>
-          <label><input type="checkbox" id="chk-dbn" checked> 3D Neural DBN Arcs</label>
-          <label><input type="checkbox" id="chk-uncertainty" checked> Kalman Uncertainty Rings</label>
-          <label><input type="checkbox" id="chk-spillback" checked> Corridor Spillback Heat</label>
-          <label><input type="checkbox" id="chk-v2x" checked> V2X Communication Beams</label>
+        <div class="sc-foot">
+          <span id="kpi-c-safety" class="safety-pill">0 Collisions</span>
+          <span id="kpi-c-live" class="live-stat">0 active · 0.0 m/s</span>
         </div>
       </div>
-
-      <div class="drawer-sec">
-        <div class="sec-head">DBN Edge Relation Filter</div>
-        <div class="ctrl-row">
-          <span>Min Edge Prob ω</span>
-          <b id="lbl-omega">0.08</b>
-        </div>
-        <input type="range" id="slider-omega" min="0.05" max="0.85" step="0.01" value="0.08" style="width:100%;">
-        <div class="chk-list">
-          <label><input type="checkbox" id="chk-rel-0" checked><span class="swatch" style="background:#38bdf8;"></span> Same-Corridor Platoon</label>
-          <label><input type="checkbox" id="chk-rel-1" checked><span class="swatch" style="background:#fb7185;"></span> Junction Conflict</label>
-          <label><input type="checkbox" id="chk-rel-2" checked><span class="swatch" style="background:#fbbf24;"></span> Downstream Spillback</label>
-          <label><input type="checkbox" id="chk-rel-3" checked><span class="swatch" style="background:#34d399;"></span> Upstream Feeder Wave</label>
-        </div>
-      </div>
-
-      <div class="drawer-sec">
-        <div class="sec-head">Selected Vehicle &amp; DBN Inspector</div>
-        <div id="inspector-body"></div>
-      </div>
-    </aside>
+    </section>
   </main>
 
-  <footer id="bottombar">
-    <button type="button" id="btn-play">Pause</button>
-    <span id="lbl-clock">t = 0.0 s</span>
-    <select id="select-speed" title="Playback Speed">
-      <option value="0.25">0.25x</option>
-      <option value="0.5">0.5x</option>
-      <option value="1" selected>1.0x</option>
-      <option value="2">2.0x</option>
-      <option value="4">4.0x</option>
-    </select>
-    <input type="range" id="slider-scrub" min="0" max="100" step="0.05" value="0">
-    <div id="sparkline-wrap">
-      <small>Halted Queue Trajectory (Cyan=Primary, Rose=Baseline)</small>
-      <canvas id="sparkline-canvas"></canvas>
+  <!-- Optional Dismissible Floating Vehicle Chip -->
+  <aside id="vehicle-chip" class="glass-surface" aria-label="Selected vehicle telemetry" hidden>
+    <span id="chip-id">veh_0</span>
+    <span id="chip-mode" data-mode="go-wave">Go-Wave</span>
+    <span id="chip-speed" class="chip-metric">0.0 m/s</span>
+    <span id="chip-delay">0% risk</span>
+    <button type="button" id="chip-close" title="Dismiss" aria-label="Dismiss selected vehicle">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M6 6l12 12M18 6L6 18"/>
+      </svg>
+    </button>
+  </aside>
+
+  <!-- Element C: Bottom Center Floating Playback Bar -->
+  <footer id="bottom-hud-wrap">
+    <div id="playback-bar" class="glass-surface">
+      <div class="pb-transport">
+        <button type="button" id="btn-play" data-playing="true" title="Play / Pause (Space)" aria-label="Pause playback">
+          <svg class="icon-pause" viewBox="0 0 24 24" aria-hidden="true">
+            <rect x="6" y="5" width="4" height="14" rx="1.2"/>
+            <rect x="14" y="5" width="4" height="14" rx="1.2"/>
+          </svg>
+          <svg class="icon-play" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M7.5 5.2a1 1 0 0 1 1.52-.85l10.2 6.3a1 1 0 0 1 0 1.7l-10.2 6.3a1 1 0 0 1-1.52-.85V5.2z"/>
+          </svg>
+        </button>
+
+        <span id="time-readout">00:00 / 00:00</span>
+
+        <div class="scrubber-wrap">
+          <span id="incident-window" aria-hidden="true" hidden></span>
+          <input type="range" id="timeline-slider" min="0" max="1000" step="any" value="0" aria-label="Simulation timeline">
+        </div>
+
+        <button type="button" id="btn-speed" data-speed="1" title="Cycle playback speed" aria-label="Playback speed 1x">1×</button>
+      </div>
+
+      <div class="pb-layers">
+        <div class="arcs-cluster">
+          <button type="button" id="toggle-arcs" class="pill-toggle active" aria-pressed="true">Causal Arcs</button>
+          <div id="arcs-legend" aria-label="Causal relation legend">
+            <span class="leg-item"><span class="leg-dot leg-dot--corridor" aria-hidden="true"></span>Corridor</span>
+            <span class="leg-item"><span class="leg-dot leg-dot--conflict" aria-hidden="true"></span>Conflict</span>
+            <span class="leg-item"><span class="leg-dot leg-dot--spillback" aria-hidden="true"></span>Spillback</span>
+            <span class="leg-item"><span class="leg-dot leg-dot--wave" aria-hidden="true"></span>Wave</span>
+          </div>
+        </div>
+
+        <button type="button" id="toggle-buildings" class="pill-toggle active" aria-pressed="true">3D Buildings</button>
+      </div>
     </div>
   </footer>
-</div>
 
-<script id="swarm-payload" type="application/json">{{PAYLOAD_JSON}}</script>
-<script>
+  <!-- Boot & Fail-Loud Error Overlays -->
+  <div id="loading-overlay">
+    <div class="boot-card">
+      <div class="boot-ring" aria-hidden="true"></div>
+      <div class="boot-title">Neural DBN 3D Urban Replay</div>
+      <div id="loading-status">Decompressing city geometry &amp; swarm trajectories…</div>
+    </div>
+  </div>
+
+  <div id="error-banner" role="alert" hidden>
+    <div class="err-heading">3D WebGL2 Viewer Error</div>
+    <p id="error-message"></p>
+  </div>
+
+  <script id="swarm-payload-meta" type="application/json">{{PAYLOAD_META_JSON}}</script>
+  <script id="swarm-payload-gz" type="application/octet-stream">{{PAYLOAD_GZ_B64}}</script>
+  <script>
 {{ENGINE_JS}}
-document.addEventListener("DOMContentLoaded", function () {
-  const rawJson = document.getElementById("swarm-payload").textContent;
-  const payload = JSON.parse(rawJson);
-  window.mountCityDBNViewer(payload);
-});
-</script>
+;(function () {
+  "use strict";
+  const bar = document.getElementById("top-hud");
+  if (bar && !("focusGroup" in HTMLElement.prototype)) {
+    const getItems = () => Array.from(bar.querySelectorAll("button")).filter((b) => b.offsetParent !== null);
+    const initItems = getItems();
+    initItems.forEach((b, i) => { b.tabIndex = i === 0 ? 0 : -1; });
+    bar.addEventListener("focusin", (ev) => {
+      const items = getItems();
+      if (items.includes(ev.target)) {
+        items.forEach((b) => { b.tabIndex = b === ev.target ? 0 : -1; });
+      }
+    });
+    bar.addEventListener("keydown", (ev) => {
+      const items = getItems();
+      const idx = items.indexOf(document.activeElement);
+      if (idx < 0 || items.length === 0) return;
+      const rtl = getComputedStyle(bar).direction === "rtl";
+      let next = -1;
+      if (ev.key === "ArrowRight") next = (idx + (rtl ? -1 : 1) + items.length) % items.length;
+      else if (ev.key === "ArrowLeft") next = (idx + (rtl ? 1 : -1) + items.length) % items.length;
+      else if (ev.key === "Home") next = 0;
+      else if (ev.key === "End") next = items.length - 1;
+      if (next >= 0) {
+        ev.preventDefault();
+        items.forEach((b, i) => { b.tabIndex = i === next ? 0 : -1; });
+        items[next].focus();
+      }
+    });
+  }
+
+  const slider = document.getElementById("timeline-slider");
+  if (slider) {
+    let prevRaw = "";
+    const syncSliderVars = () => {
+      const raw = slider.value + "|" + slider.min + "|" + slider.max;
+      if (raw === prevRaw) return;
+      prevRaw = raw;
+      const minV = parseFloat(slider.min) || 0;
+      const maxV = parseFloat(slider.max) || 100;
+      const curV = parseFloat(slider.value) || 0;
+      const pct = maxV > minV ? Math.max(0, Math.min(100, ((curV - minV) / (maxV - minV)) * 100)) : 0;
+      slider.style.setProperty("--attr-min", String(minV));
+      slider.style.setProperty("--attr-max", String(maxV));
+      slider.style.setProperty("--control-value", String(curV));
+      slider.style.setProperty("--slider-progress", pct.toFixed(2) + "%");
+    };
+    syncSliderVars();
+    slider.addEventListener("input", syncSliderVars);
+    slider.addEventListener("change", syncSliderVars);
+  }
+})();
+  </script>
 </body>
 </html>

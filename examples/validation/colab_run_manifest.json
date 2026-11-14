@@ -1,0 +1,31 @@
+{
+  "completed_at_utc": "2026-11-14T07:08:26.117766+00:00",
+  "cuda_version": "13.0",
+  "git_sha": "873c9edd12206d247d51f591fdcd1ecd30caf5ed",
+  "gpu_name": "NVIDIA A100-SXM4-40GB",
+  "rollout_archive_sha256": "36b8f745ce27918dec32513b1e8581a83ad33cd130309c93722a4c0542a24e3e",
+  "rollout_source": "/content/colab_rollouts.tar.gz",
+  "sota_cloud_xl": {
+    "best_epoch": 13,
+    "best_val_loss": 0.45739755034446716,
+    "checkpoint_sha256": "25235ea3d54784896928a9dc7592cca31a535f9d9c8b5f68ab290d6b77c1afb8",
+    "temperatures": {
+      "calibrated": true,
+      "t_delay": 1.04435235490362,
+      "t_edge": 0.4321560638313335,
+      "t_link": 1.373297801295477
+    }
+  },
+  "sota_local": {
+    "best_epoch": 9,
+    "best_val_loss": 0.49239325523376465,
+    "checkpoint_sha256": "6a41cfe8225432919922a209eef48bd0abafaf22330d94f2c04a98836ea8c8e5",
+    "temperatures": {
+      "calibrated": true,
+      "t_delay": 1.0058742520034019,
+      "t_edge": 0.4413643838181689,
+      "t_link": 1.1560272591092375
+    }
+  },
+  "torch_version": "2.14.1+cu130"
+}
