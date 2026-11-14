@@ -47,9 +47,19 @@ def compute_ecoglide_speeds(
         )
 
     cfg = control_config
-    a_comf = cfg.comfort_accel_mps2
     b_comf = cfg.comfort_decel_mps2
     v_dead = cfg.zero_speed_deadzone_mps
+
+    lane_queues: dict[tuple[str, int], list[str]] = {}
+    for q_vid, q_veh in belief.vehicles.items():
+        if q_veh.in_junction_id is None:
+            lane_queues.setdefault((q_veh.corridor_id, q_veh.lane_index), []).append(q_vid)
+    same_lane_lead: dict[str, str] = {}
+    for q_vids in lane_queues.values():
+        if len(q_vids) > 1:
+            ordered_q = sorted(q_vids, key=lambda item: (float(belief.vehicles[item].mean_s_m), item))
+            for q_i in range(len(ordered_q) - 1):
+                same_lane_lead[ordered_q[q_i]] = ordered_q[q_i + 1]
 
     desired_speeds: dict[str, float] = {}
     effective_modes: dict[str, LongitudinalMode] = {}
@@ -76,12 +86,28 @@ def compute_ecoglide_speeds(
             effective_modes[vid] = LongitudinalMode.GO_WAVE
             continue
 
-        d_stop = max(0.0, corr.length_m - float(veh.mean_s_m) - 0.8 - 0.5 * pos_std)
+        lead_id = same_lane_lead.get(vid)
+        if lead_id is not None and vid in schedule.must_hold_stopline and v_cur <= 0.75:
+            lead_v_bel = belief.vehicles[lead_id]
+            est_gap = (
+                float(lead_v_bel.mean_s_m)
+                - float(veh.mean_s_m)
+                - 0.5 * (float(lead_v_bel.length_m) + float(veh.length_m))
+            )
+            if float(lead_v_bel.mean_v_mps) <= 0.75 and est_gap <= cfg.idm_min_gap_m + 3.50:
+                desired_speeds[vid] = 0.0
+                effective_modes[vid] = LongitudinalMode.YIELD
+                continue
+
+        d_stop = max(0.0, corr.length_m - float(veh.mean_s_m) - 0.6 - cfg.uncertainty_safety_beta * pos_std)
         v_comf_stop = min(v_max, math.sqrt(2.0 * b_comf * d_stop))
         m_base = base_modes.get(vid, LongitudinalMode.CRUISE) if base_modes is not None else LongitudinalMode.CRUISE
+        to_junc = topology.junctions.get(corr.to_junction)
+        is_signalized_approach = to_junc is not None and to_junc.tls_id is not None and to_junc.num_tls_links > 0
 
         if vid in schedule.must_hold_stopline:
-            if v_comf_stop < v_dead:
+            raw_dist_to_line = corr.length_m - float(veh.mean_s_m)
+            if v_comf_stop < v_dead or d_stop <= 1.25 or (v_cur <= 0.85 and raw_dist_to_line <= 5.5):
                 v_des = 0.0
                 eff_mode = LongitudinalMode.YIELD
             elif d_stop > 18.0 and v_comf_stop >= v_min_glide and m_base == LongitudinalMode.ECO_GLIDE:
@@ -96,14 +122,18 @@ def compute_ecoglide_speeds(
                 v_des = v_max
                 eff_mode = LongitudinalMode.GO_WAVE
             elif m_base == LongitudinalMode.ECO_GLIDE:
-                if math.isfinite(t_slot) and t_slot > float(veh.free_eta_s) + 0.30:
+                if (
+                    not is_signalized_approach
+                    and math.isfinite(t_slot)
+                    and t_slot > float(veh.free_eta_s) + 0.30
+                ):
                     v_pace = d_stop / max(t_slot, 0.5)
                     v_des = min(v_max, max(v_min_glide, v_pace))
                 else:
-                    v_des = min(v_max, max(v_min_glide, 0.78 * v_max))
+                    v_des = min(v_max, max(v_min_glide, 0.96 * v_max))
                 eff_mode = LongitudinalMode.ECO_GLIDE
             else:
-                v_des = min(v_max, max(v_cur + a_comf * dt, 0.92 * v_max))
+                v_des = v_max
                 eff_mode = LongitudinalMode.CRUISE
         else:
             # Deferred slot reservation: smooth Eco-Glide arrival pacing without full stop where feasible.
@@ -122,7 +152,14 @@ def compute_ecoglide_speeds(
                     eff_mode = LongitudinalMode.ECO_GLIDE if v_des >= v_min_glide else LongitudinalMode.YIELD
             else:
                 v_des = 0.0 if v_comf_stop < v_dead else v_comf_stop
-                eff_mode = LongitudinalMode.YIELD
+                if is_signalized_approach and d_stop > 35.0 and v_des >= 0.90 * v_max:
+                    eff_mode = (
+                        LongitudinalMode.CRUISE
+                        if m_base == LongitudinalMode.YIELD
+                        else m_base
+                    )
+                else:
+                    eff_mode = LongitudinalMode.YIELD
 
         require_finite(v_des, f"EcoGlideProfile.desired_speeds[{vid}]")
         desired_speeds[vid] = v_des

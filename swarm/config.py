@@ -524,11 +524,11 @@ class ControlConfig:
     conflict_penalty: float = 8.0
     platoon_harmony_weight: float = 1.2
     conflict_risk_threshold: float = 0.22
-    tls_min_green_hold_s: float = 2.5
+    tls_min_green_hold_s: float = 6.0
     tls_yellow_clearance_s: float = 3.0
-    reroute_interval_s: float = 5.0
+    reroute_interval_s: float = 6.0
     reroute_min_stopline_dist_m: float = 35.0
-    reroute_hysteresis_s: float = 3.0
+    reroute_hysteresis_s: float = 15.0
     reroute_spill_weight: float = 18.0
     reroute_flux_weight: float = 8.0
     min_glide_speed_mps: float = 2.2
@@ -578,6 +578,15 @@ class ControlConfig:
         ):
             if _require_strict_float(getattr(self, pos_field), f"ControlConfig.{pos_field}") <= 0.0:
                 raise ConfigValidationError(f"ControlConfig.{pos_field} must be > 0.")
+        if self.tls_min_green_hold_s < self.tls_yellow_clearance_s:
+            raise ConfigValidationError(
+                f"ControlConfig.tls_min_green_hold_s ({self.tls_min_green_hold_s}) must be >= "
+                f"tls_yellow_clearance_s ({self.tls_yellow_clearance_s}) to prevent mid-yellow thrashing.",
+                context={
+                    "tls_min_green_hold_s": self.tls_min_green_hold_s,
+                    "tls_yellow_clearance_s": self.tls_yellow_clearance_s,
+                },
+            )
         if self.max_decel_mps2 < self.comfort_decel_mps2:
             raise ConfigValidationError("ControlConfig.max_decel_mps2 must be >= comfort_decel_mps2.")
 

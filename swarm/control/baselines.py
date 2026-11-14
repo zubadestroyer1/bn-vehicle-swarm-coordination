@@ -33,7 +33,7 @@ from ..logging_utils import (
     require_finite,
 )
 from .ecoglide import compute_ecoglide_speeds
-from .safety import ObservableSafetyFilter
+from .safety import ObservableSafetyFilter, select_actuated_target_speeds
 from .scheduler import PriorityDAGScheduler, ScheduleResult
 from .v2x import VoIV2XSelector
 
@@ -224,6 +224,7 @@ class FCFSReservationController:
         self._last_schedule: ScheduleResult | None = None
         self._prev_post_safety_accels: dict[str, float] = {}
         self._prev_v2x_polls: tuple[str, ...] = ()
+        self._speed_controlled_vehs: set[str] = set()
         self._prev_sim_time: float = 0.0
         self._has_stepped: bool = False
 
@@ -256,6 +257,7 @@ class FCFSReservationController:
         self._last_schedule = None
         self._prev_post_safety_accels = {}
         self._prev_v2x_polls = ()
+        self._speed_controlled_vehs.clear()
         self._prev_sim_time = 0.0
         self._has_stepped = False
 
@@ -328,6 +330,16 @@ class FCFSReservationController:
             else:
                 modes[vid] = mode
 
+        actuated_speeds, self._speed_controlled_vehs = select_actuated_target_speeds(
+            belief=belief,
+            topology=self._topology,
+            safety=safety,
+            control_config=self._control_config,
+            must_hold_stopline=schedule.must_hold_stopline,
+            granted_vehicles=schedule.granted_vehicles,
+            previously_controlled=self._speed_controlled_vehs,
+        )
+
         self._prev_post_safety_accels = dict(safety.post_safety_accels)
         self._prev_v2x_polls = v2x_polls
         self._prev_sim_time = now
@@ -336,7 +348,7 @@ class FCFSReservationController:
         latency_ms = (time.perf_counter() - t0) * 1000.0
         return SwarmControlAction(
             sim_time=now,
-            target_speeds=safety.target_speeds,
+            target_speeds=actuated_speeds,
             post_safety_accels=safety.post_safety_accels,
             modes=modes,
             tls_desired_greens=schedule.tls_desired_greens,

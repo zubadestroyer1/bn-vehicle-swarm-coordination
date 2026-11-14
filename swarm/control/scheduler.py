@@ -59,7 +59,23 @@ class ScheduleResult:
 @dataclass
 class _TlsHoldRecord:
     green_links: frozenset[int]
-    since_sim_time: float
+    requested_at: float
+    green_started_at: float | None = None
+
+
+def _are_links_live_green(
+    links: Iterable[int],
+    tls_id: str,
+    tls_states: Mapping[str, str],
+) -> bool:
+    """Return ``True`` when all ``links`` are currently ``'G'``/``'g'`` in ``tls_states`` (or untracked)."""
+    ryg = tls_states.get(tls_id)
+    if ryg is None:
+        return True
+    link_list = list(links)
+    if not link_list:
+        return True
+    return all(0 <= idx < len(ryg) and ryg[idx] in ("G", "g") for idx in link_list)
 
 
 def are_tls_links_compatible(
@@ -121,15 +137,20 @@ def _pair_turn_conflict_prob(
     corr_a: CorridorSpec,
     veh_b: VehicleBelief,
     corr_b: CorridorSpec,
+    open_lanes_by_edge: Mapping[str, int] | None = None,
 ) -> float:
     """Compute belief-expected turn conflict probability ``P(conflict(a, b))`` at ``junction_id``."""
+    junc = topology.junctions.get(junction_id)
+    if junc is None:
+        raise TopologyIntegrityError(
+            f"Unknown junction_id {junction_id!r} in _pair_turn_conflict_prob.",
+            context={"junction_id": junction_id},
+        )
+
     a_clearing = veh_a.in_junction_id == junction_id and corr_a.to_junction != junction_id
     b_clearing = veh_b.in_junction_id == junction_id and corr_b.to_junction != junction_id
-    if a_clearing or b_clearing:
-        # Vehicle actively clearing `junction_id` into outgoing `corr`: conservatively hold
-        # approaching vehicles without indexing downstream `corr.turn_options` at `junction_id`.
-        return 1.0
-    if corr_a.to_junction != junction_id:
+
+    if not a_clearing and corr_a.to_junction != junction_id:
         raise TopologyIntegrityError(
             f"Vehicle {veh_a.veh_id!r} corridor {corr_a.corridor_id!r} targets junction "
             f"{corr_a.to_junction!r}, not {junction_id!r} (in_junction_id={veh_a.in_junction_id!r}).",
@@ -141,7 +162,7 @@ def _pair_turn_conflict_prob(
                 "in_junction_id": veh_a.in_junction_id,
             },
         )
-    if corr_b.to_junction != junction_id:
+    if not b_clearing and corr_b.to_junction != junction_id:
         raise TopologyIntegrityError(
             f"Vehicle {veh_b.veh_id!r} corridor {corr_b.corridor_id!r} targets junction "
             f"{corr_b.to_junction!r}, not {junction_id!r} (in_junction_id={veh_b.in_junction_id!r}).",
@@ -153,16 +174,68 @@ def _pair_turn_conflict_prob(
                 "in_junction_id": veh_b.in_junction_id,
             },
         )
+
+    if a_clearing and b_clearing:
+        return 0.0
+
+    is_signalized_tls = junc.tls_id is not None and junc.num_tls_links > 0
+    open_lanes = open_lanes_by_edge or {}
+
+    if a_clearing or b_clearing:
+        if is_signalized_tls:
+            # At signalized TLS junctions, verify_conflict_free_greens + 3.0s yellow clearance
+            # enforce cross-phase separation; longitudinal spacing is enforced by leader headway & IDM.
+            return 0.0
+
+        veh_app, corr_app, corr_clear = (
+            (veh_b, corr_b, corr_a) if a_clearing else (veh_a, corr_a, corr_b)
+        )
+        if not corr_app.turn_options:
+            return 0.0
+        clearing_feeders = [
+            (in_cid, opt_c)
+            for in_cid in junc.incoming_corridors
+            if not topology.corridors[in_cid].is_exit_fringe
+            for opt_c in topology.corridors[in_cid].turn_options
+            if opt_c.to_corridor == corr_clear.corridor_id
+        ]
+        if not clearing_feeders:
+            return 0.0
+        clear_open_lanes = topology.effective_lanes(corr_clear.corridor_id, open_lanes)
+        total_clear = 0.0
+        for opt_app in corr_app.turn_options:
+            p_app = float(veh_app.turn_probs[opt_app.turn_idx])
+            if p_app <= 1e-6:
+                continue
+            conflicts = any(
+                (
+                    in_cid != corr_app.corridor_id
+                    and (
+                        opt_c.to_corridor == opt_app.to_corridor
+                        or topology.turn_conflict(junction_id, opt_c, opt_app)
+                    )
+                )
+                or (
+                    in_cid == corr_app.corridor_id
+                    and (
+                        topology.turn_conflict(junction_id, opt_c, opt_app)
+                        or (opt_c.to_corridor == opt_app.to_corridor and clear_open_lanes <= 1)
+                    )
+                )
+                for in_cid, opt_c in clearing_feeders
+            )
+            if conflicts:
+                total_clear += p_app
+        return max(0.0, min(1.0, total_clear))
+
     if not corr_a.turn_options or not corr_b.turn_options:
         return 0.0
-    if (
-        veh_a.in_junction_id is None
-        and veh_b.in_junction_id is None
-        and corr_a.corridor_id == corr_b.corridor_id
-        and veh_a.lane_index == veh_b.lane_index
-    ):
+
+    same_corridor = corr_a.corridor_id == corr_b.corridor_id
+    if same_corridor and veh_a.lane_index == veh_b.lane_index:
         # Same-lane longitudinal headway (idm_time_headway_s) is enforced directly on lane leaders.
         return 0.0
+
     total = 0.0
     for opt_a in corr_a.turn_options:
         p_a = float(veh_a.turn_probs[opt_a.turn_idx])
@@ -172,7 +245,18 @@ def _pair_turn_conflict_prob(
             p_b = float(veh_b.turn_probs[opt_b.turn_idx])
             if p_b <= 1e-6:
                 continue
-            if opt_a.to_corridor == opt_b.to_corridor or topology.turn_conflict(junction_id, opt_a, opt_b):
+            if same_corridor:
+                # Parallel lanes on the same approach discharge side-by-side into multi-lane outgoing
+                # corridors; conflict ONLY on crossing turn paths or single-lane merge bottlenecks.
+                has_conflict = topology.turn_conflict(junction_id, opt_a, opt_b) or (
+                    opt_a.to_corridor == opt_b.to_corridor
+                    and topology.effective_lanes(opt_a.to_corridor, open_lanes) <= 1
+                )
+            else:
+                has_conflict = opt_a.to_corridor == opt_b.to_corridor or topology.turn_conflict(
+                    junction_id, opt_a, opt_b
+                )
+            if has_conflict:
                 total += p_a * p_b
     return max(0.0, min(1.0, total))
 
@@ -194,10 +278,14 @@ class PriorityDAGScheduler:
     def __init__(self, control_config: ControlConfig) -> None:
         self._cfg = control_config
         self._tls_holds: dict[str, _TlsHoldRecord] = {}
+        self._tls_red_elapsed_s: dict[str, np.ndarray] = {}
+        self._last_decode_time: float | None = None
 
     def reset(self) -> None:
-        """Clear per-TLS minimum-green hold state across episodes."""
+        """Clear per-TLS minimum-green hold and red-starvation state across episodes."""
         self._tls_holds.clear()
+        self._tls_red_elapsed_s.clear()
+        self._last_decode_time = None
 
     def decode(
         self,
@@ -215,6 +303,24 @@ class PriorityDAGScheduler:
         First-Come-First-Served (Dresner-Stone AIM) order ``(entered_at, free_eta_s, veh_id)``.
         """
         require_finite(belief.sim_time, "SwarmBeliefState.sim_time")
+        now_sim = float(belief.sim_time)
+        dt_red = (
+            max(0.0, float(belief.dt))
+            if self._last_decode_time is None
+            else max(0.0, min(5.0, now_sim - self._last_decode_time))
+        )
+        self._last_decode_time = now_sim
+        for tls_id, ryg in belief.tls_states.items():
+            red_arr = self._tls_red_elapsed_s.get(tls_id)
+            if red_arr is None or red_arr.shape != (len(ryg),):
+                red_arr = np.zeros(len(ryg), dtype=np.float64)
+                self._tls_red_elapsed_s[tls_id] = red_arr
+            for idx, ch in enumerate(ryg):
+                if ch in ("G", "g"):
+                    red_arr[idx] = 0.0
+                else:
+                    red_arr[idx] += dt_red
+
         cfg = self._cfg
         theta_spill = cfg.spillback_threshold
         theta_risk = cfg.conflict_risk_threshold
@@ -327,17 +433,25 @@ class PriorityDAGScheduler:
 
             ordered_approaching = self._sort_approaching_vehicles(
                 approaching=approaching,
+                junc=junc,
+                topology=topology,
+                belief=belief,
                 lane_leader=lane_leader,
+                corridor_q_spill=corridor_q_spill,
+                corridor_rem_slots=corridor_rem_slots,
+                enable_spillback_gate=enable_spillback_gate,
                 maxsum_result=maxsum_result,
                 dbn_snapshot=dbn_snapshot,
             )
 
+            is_signalized_tls = junc.tls_id is not None and junc.num_tls_links > 0
             active_green_links: set[int] = set()
-            if junc.tls_id is not None and junc.num_tls_links > 0:
+            if is_signalized_tls:
                 active_green_links.update(
                     self._retained_min_hold_greens(
                         junc=junc,
                         topology=topology,
+                        belief=belief,
                         approaching=approaching,
                         corridor_q_spill=corridor_q_spill,
                         corridor_rem_slots=corridor_rem_slots,
@@ -394,7 +508,15 @@ class PriorityDAGScheduler:
 
                 for earlier in scheduled_at_junc:
                     earlier_corr = topology.corridors[earlier.corridor_id]
-                    p_conf = _pair_turn_conflict_prob(topology, jid, veh, corr, earlier, earlier_corr)
+                    p_conf = _pair_turn_conflict_prob(
+                        topology,
+                        jid,
+                        veh,
+                        corr,
+                        earlier,
+                        earlier_corr,
+                        open_lanes_by_edge=belief.open_lanes_by_edge,
+                    )
                     if p_conf > theta_risk:
                         t_start = max(t_start, scheduled_end_s[earlier.veh_id])
 
@@ -407,10 +529,8 @@ class PriorityDAGScheduler:
                     else maxsum_result.modes.get(vid, LongitudinalMode.CRUISE) != LongitudinalMode.YIELD
                 )
 
-                # Check TLS green-link compatibility for immediate crossing grant.
-                tls_ok = True
-                chosen_links: tuple[int, ...] = ()
-                if junc.tls_id is not None and junc.num_tls_links > 0:
+                if is_signalized_tls:
+                    assert junc.tls_id is not None
                     chosen_links = self._select_vehicle_tls_links(
                         veh=veh,
                         corr=corr,
@@ -422,31 +542,51 @@ class PriorityDAGScheduler:
                         topology=topology,
                         enable_spillback_gate=enable_spillback_gate,
                     )
-                    if opt_map.tls_link_indices and not chosen_links:
-                        tls_ok = False
-
-                if mode_allows_entry and tls_ok and t_start <= float(veh.free_eta_s) + _IMMEDIATE_GRANT_SLACK_S:
-                    granted_vehicles.add(vid)
-                    active_green_links.update(chosen_links)
-                    if not out_corr.is_exit_fringe and float(veh.free_eta_s) <= 4.5:
-                        corridor_rem_slots[out_cid] = max(0, corridor_rem_slots.get(out_cid, 1) - 1)
-                    scheduled_start_s[vid] = t_start
-                    scheduled_end_s[vid] = t_end
-                    scheduled_at_junc.append(veh)
+                    tls_ok = not (opt_map.tls_link_indices and not chosen_links)
+                    if tls_ok:
+                        active_green_links.update(chosen_links)
+                        if _are_links_live_green(chosen_links, junc.tls_id, belief.tls_states):
+                            granted_vehicles.add(vid)
+                            if not out_corr.is_exit_fringe and float(veh.free_eta_s) <= 2.0:
+                                corridor_rem_slots[out_cid] = max(0, corridor_rem_slots.get(out_cid, 1) - 1)
+                            scheduled_start_s[vid] = t_start
+                            scheduled_end_s[vid] = t_end
+                            scheduled_at_junc.append(veh)
+                        else:
+                            # Cross-street is clearing yellow in SUMO; TLS state 'r' physically holds stopline
+                            # while keeping LC2013 cooperative turn-pocket lane-changing active upstream.
+                            wait_green_start = max(t_start, cfg.tls_yellow_clearance_s)
+                            scheduled_start_s[vid] = wait_green_start
+                            scheduled_end_s[vid] = wait_green_start + dur
+                    else:
+                        # Red TLS link physically governs stopline without sticky setSpeed overriding LC2013.
+                        scheduled_start_s[vid] = math.inf
+                        scheduled_end_s[vid] = math.inf
                 else:
-                    scheduled_start_s[vid] = t_start
-                    scheduled_end_s[vid] = t_end
-                    scheduled_at_junc.append(veh)
-                    # Hold at stop-line if wait is substantial or close to stop-line without TLS green.
-                    if not tls_ok or t_start > float(veh.free_eta_s) + 2.5 or float(veh.free_eta_s) < 1.8:
-                        must_hold_stopline.add(vid)
+                    if mode_allows_entry and t_start <= float(veh.free_eta_s) + _IMMEDIATE_GRANT_SLACK_S:
+                        granted_vehicles.add(vid)
+                        if not out_corr.is_exit_fringe and float(veh.free_eta_s) <= 2.0:
+                            corridor_rem_slots[out_cid] = max(0, corridor_rem_slots.get(out_cid, 1) - 1)
+                        scheduled_start_s[vid] = t_start
+                        scheduled_end_s[vid] = t_end
+                        scheduled_at_junc.append(veh)
+                    else:
+                        scheduled_start_s[vid] = t_start
+                        scheduled_end_s[vid] = t_end
+                        scheduled_at_junc.append(veh)
+                        if t_start > float(veh.free_eta_s) + _IMMEDIATE_GRANT_SLACK_S or not mode_allows_entry:
+                            must_hold_stopline.add(vid)
 
             # Complete non-conflicting compatible green phase for dual-through progression & idle junctions.
-            if junc.tls_id is not None and junc.num_tls_links > 0:
+            if is_signalized_tls:
+                assert junc.tls_id is not None
                 self._fill_compatible_greens(
                     junc=junc,
                     topology=topology,
                     belief=belief,
+                    approaching=approaching,
+                    maxsum_result=maxsum_result,
+                    dbn_snapshot=dbn_snapshot,
                     active_green_links=active_green_links,
                     corridor_q_spill=corridor_q_spill,
                     corridor_rem_slots=corridor_rem_slots,
@@ -454,12 +594,37 @@ class PriorityDAGScheduler:
                 )
                 final_greens = frozenset(active_green_links)
                 verify_conflict_free_greens(junc, final_greens)
+                now_t = float(belief.sim_time)
                 prev_hold = self._tls_holds.get(junc.tls_id)
-                if prev_hold is None or prev_hold.green_links != final_greens:
+                live_green_now = _are_links_live_green(final_greens, junc.tls_id, belief.tls_states)
+                if prev_hold is None or not are_tls_links_compatible(
+                    final_greens,
+                    prev_hold.green_links,
+                    junc.tls_link_foe_matrix,
+                    junc.junction_id,
+                ):
                     self._tls_holds[junc.tls_id] = _TlsHoldRecord(
                         green_links=final_greens,
-                        since_sim_time=float(belief.sim_time),
+                        requested_at=now_t,
+                        green_started_at=now_t if live_green_now else None,
                     )
+                else:
+                    started_at = prev_hold.green_started_at
+                    if started_at is None and live_green_now:
+                        started_at = now_t
+                    if (
+                        started_at is not None
+                        and (now_t - started_at) >= cfg.tls_min_green_hold_s - 1e-9
+                        and final_greens != prev_hold.green_links
+                    ):
+                        self._tls_holds[junc.tls_id] = _TlsHoldRecord(
+                            green_links=final_greens,
+                            requested_at=now_t,
+                            green_started_at=now_t if live_green_now else None,
+                        )
+                    else:
+                        prev_hold.green_links = final_greens
+                        prev_hold.green_started_at = started_at
                 tls_desired_greens[junc.tls_id] = final_greens
 
         return ScheduleResult(
@@ -473,7 +638,13 @@ class PriorityDAGScheduler:
     def _sort_approaching_vehicles(
         self,
         approaching: list[VehicleBelief],
+        junc: JunctionSpec,
+        topology: RoadTopology,
+        belief: SwarmBeliefState,
         lane_leader: Mapping[str, str],
+        corridor_q_spill: Mapping[str, float],
+        corridor_rem_slots: Mapping[str, int],
+        enable_spillback_gate: bool,
         maxsum_result: MaxSumResult | None,
         dbn_snapshot: DBNStateSnapshot | None,
     ) -> list[VehicleBelief]:
@@ -485,11 +656,121 @@ class PriorityDAGScheduler:
                 # Dresner-Stone AIM First-Come-First-Served order (strictly observable entered_at).
                 return (0, float(v.entered_at), float(v.free_eta_s), 0.0, v.veh_id)
         else:
+            is_sig = junc.tls_id is not None and junc.num_tls_links > 0
+            theta_spill = self._cfg.spillback_threshold
+            movement_own_pressure: dict[tuple[str, int], float] = {}
+            movement_queued_count: dict[tuple[str, int], int] = {}
+            movement_close_count: dict[tuple[str, int], int] = {}
+            movement_links: dict[tuple[str, int], tuple[int, ...]] = {}
+            movement_spilled: dict[tuple[str, int], bool] = {}
+            veh_map_turn: dict[str, tuple[str, int]] = {}
+            for v_item in approaching:
+                in_c = topology.corridors[v_item.corridor_id]
+                if not in_c.turn_options:
+                    continue
+                opt_m = max(in_c.turn_options, key=lambda o: (float(v_item.turn_probs[o.turn_idx]), -o.turn_idx))
+                m_key = (v_item.corridor_id, opt_m.turn_idx)
+                veh_map_turn[v_item.veh_id] = m_key
+                movement_links[m_key] = opt_m.tls_link_indices
+                out_c = topology.corridors[opt_m.to_corridor]
+                q_exp = maxsum_result.expected_out_spillback.get(v_item.veh_id, 0.0)
+                is_spilled = (
+                    enable_spillback_gate
+                    and not out_c.is_exit_fringe
+                    and (
+                        q_exp > theta_spill
+                        or corridor_q_spill.get(opt_m.to_corridor, 0.0) > theta_spill
+                        or corridor_rem_slots.get(opt_m.to_corridor, 1) <= 0
+                    )
+                )
+                movement_spilled[m_key] = is_spilled
+                if is_spilled:
+                    continue
+                movement_own_pressure.setdefault(m_key, 0.0)
+
+                w_s = min(60.0, max(0.0, float(v_item.wait_time_s)))
+                c_s = (
+                    max(0.0, float(dbn_snapshot.cascade_score.get(v_item.veh_id, 0.0)))
+                    if dbn_snapshot is not None
+                    else 0.0
+                )
+                is_slow_queue = float(v_item.mean_v_mps) < 2.5
+                if is_slow_queue or w_s > 1.0:
+                    movement_queued_count[m_key] = movement_queued_count.get(m_key, 0) + 1
+                if float(v_item.free_eta_s) <= 4.5:
+                    movement_close_count[m_key] = movement_close_count.get(m_key, 0) + 1
+
+                if float(v_item.free_eta_s) <= 10.0 or is_slow_queue:
+                    q_bonus = 0.85 if is_slow_queue else 0.0
+                    movement_own_pressure[m_key] = (
+                        movement_own_pressure.get(m_key, 0.0) + q_bonus + 0.12 * w_s + 0.45 * c_s
+                    )
+
+            if is_sig and junc.tls_id is not None:
+                red_arr = self._tls_red_elapsed_s.get(junc.tls_id)
+                prev_hold = self._tls_holds.get(junc.tls_id)
+                now_t = float(belief.sim_time)
+                for m_key, links_a in movement_links.items():
+                    if movement_spilled.get(m_key, False) or not links_a:
+                        continue
+                    # Scale movement pressure by multi-lane saturation service capacity (Max-Pressure mu_m * Q_m).
+                    mu_scale = min(2.0, 0.65 + 0.35 * float(len(links_a)))
+                    base_mp = movement_own_pressure.get(m_key, 0.0) * mu_scale
+                    # Long-red anti-starvation floor (> 24s) so minor single-lane turns never starve.
+                    if red_arr is not None and movement_queued_count.get(m_key, 0) > 0:
+                        max_red_s = max(
+                            (float(red_arr[idx]) for idx in links_a if 0 <= idx < len(red_arr)),
+                            default=0.0,
+                        )
+                        if max_red_s > 24.0:
+                            base_mp += 0.30 * (min(70.0, max_red_s) - 24.0)
+                    # Smooth green-wave continuation up to 26s while active platoon crosses (< 4.5s).
+                    if (
+                        prev_hold is not None
+                        and prev_hold.green_started_at is not None
+                        and (now_t - prev_hold.green_started_at) < 26.0
+                        and movement_close_count.get(m_key, 0) > 0
+                        and set(links_a).issubset(prev_hold.green_links)
+                    ):
+                        base_mp += 1.60 * mu_scale
+                    movement_own_pressure[m_key] = base_mp
+
+            coalition_pressure: dict[tuple[str, int], float] = {}
+            for m_key, own_p in movement_own_pressure.items():
+                total_p = own_p
+                links_a = movement_links.get(m_key, ())
+                if is_sig and links_a:
+                    for other_key, other_p in movement_own_pressure.items():
+                        if other_key == m_key or other_p <= 0.0:
+                            continue
+                        links_b = movement_links.get(other_key, ())
+                        if links_b and are_tls_links_compatible(
+                            links_b,
+                            frozenset(links_a),
+                            junc.tls_link_foe_matrix,
+                            junc.junction_id,
+                        ):
+                            weight_b = 0.25 if other_key[0] == m_key[0] else 0.90
+                            total_p += weight_b * other_p
+                coalition_pressure[m_key] = total_p
+
             def _rank_key(v: VehicleBelief) -> tuple[int, float, float, float, str]:
                 vid = v.veh_id
-                mode = maxsum_result.modes.get(vid, LongitudinalMode.CRUISE)
-                wants_cross = 1 if mode in (LongitudinalMode.GO_WAVE, LongitudinalMode.CRUISE) else 0
-                net_q = float(maxsum_result.net_crossing_preference.get(vid, 0.0))
+                m_key = veh_map_turn.get(vid)
+                is_spilled = movement_spilled.get(m_key, False) if m_key is not None else False
+                if is_sig:
+                    # At signalized TLS junctions, unspilled red-phase queues still compete for green
+                    # phase transition; cross-phase separation is enforced by verify_conflict_free_greens.
+                    wants_cross = 0 if is_spilled else 1
+                    raw_pref = float(maxsum_result.net_crossing_preference.get(vid, 0.0))
+                    base_pref = raw_pref if is_spilled else max(-1.5, raw_pref)
+                else:
+                    mode = maxsum_result.modes.get(vid, LongitudinalMode.CRUISE)
+                    wants_cross = 1 if (not is_spilled and mode in (LongitudinalMode.GO_WAVE, LongitudinalMode.CRUISE)) else 0
+                    base_pref = float(maxsum_result.net_crossing_preference.get(vid, 0.0))
+
+                coal_p = coalition_pressure.get(m_key, 0.0) if m_key is not None else 0.0
+                net_q = base_pref + coal_p
                 prec = (
                     float(dbn_snapshot.precedence_scores[vid])
                     if dbn_snapshot is not None and vid in dbn_snapshot.precedence_scores
@@ -524,6 +805,7 @@ class PriorityDAGScheduler:
         self,
         junc: JunctionSpec,
         topology: RoadTopology,
+        belief: SwarmBeliefState,
         approaching: list[VehicleBelief],
         corridor_q_spill: Mapping[str, float],
         corridor_rem_slots: Mapping[str, int],
@@ -532,21 +814,31 @@ class PriorityDAGScheduler:
     ) -> set[int]:
         assert junc.tls_id is not None
         hold = self._tls_holds.get(junc.tls_id)
-        if hold is None or (sim_time - hold.since_sim_time) >= self._cfg.tls_min_green_hold_s - 1e-9:
+        if hold is None or not hold.green_links:
             return set()
 
-        # Keep held green links ONLY while approaching demand exists within 6s AND target corridor is unspilled.
-        demanded_corridors = {
-            v.corridor_id for v in approaching if float(v.free_eta_s) <= 6.0
-        }
-        if not demanded_corridors:
-            return set()
+        if hold.green_started_at is None and _are_links_live_green(
+            hold.green_links, junc.tls_id, belief.tls_states
+        ):
+            hold.green_started_at = sim_time
+
+        if hold.green_started_at is not None:
+            if (sim_time - hold.green_started_at) >= self._cfg.tls_min_green_hold_s - 1e-9:
+                return set()
+        else:
+            max_transition_hold = (
+                2.0 * self._cfg.tls_min_green_hold_s + self._cfg.tls_yellow_clearance_s + 1.0
+            )
+            if (sim_time - hold.requested_at) >= max_transition_hold - 1e-9:
+                return set()
+
+        # Retain held unspilled links through tls_min_green_hold_s so scheduler and SumoSimulationAdapter
+        # _apply_tls_guard stay synchronized (never braking vehicles in front of a locked live green).
+        del approaching
+        theta_spill = self._cfg.spillback_threshold
 
         valid_links: set[int] = set()
-        theta_spill = self._cfg.spillback_threshold
         for in_cid in junc.incoming_corridors:
-            if in_cid not in demanded_corridors:
-                continue
             in_corr = topology.corridors[in_cid]
             for opt in in_corr.turn_options:
                 out_corr = topology.corridors[opt.to_corridor]
@@ -582,9 +874,7 @@ class PriorityDAGScheduler:
         topology: RoadTopology,
         enable_spillback_gate: bool,
     ) -> tuple[int, ...]:
-        theta_spill = self._cfg.spillback_threshold
-        theta_risk = self._cfg.conflict_risk_threshold
-
+        del veh, corr, corridor_q_spill, corridor_rem_slots, topology, enable_spillback_gate
         if not opt_map.tls_link_indices:
             return ()
         if not are_tls_links_compatible(
@@ -594,52 +884,42 @@ class PriorityDAGScheduler:
             junc.junction_id,
         ):
             return ()
-
-        chosen: list[int] = list(opt_map.tls_link_indices)
-        # Also activate secondary plausible turns (>= conflict_risk_threshold) if compatible and unspilled.
-        for opt in corr.turn_options:
-            if opt.turn_idx == opt_map.turn_idx or not opt.tls_link_indices:
-                continue
-            if float(veh.turn_probs[opt.turn_idx]) < theta_risk:
-                continue
-            out_corr = topology.corridors[opt.to_corridor]
-            spilled = (
-                enable_spillback_gate
-                and not out_corr.is_exit_fringe
-                and (
-                    corridor_q_spill.get(opt.to_corridor, 0.0) > theta_spill
-                    or corridor_rem_slots.get(opt.to_corridor, 1) <= 0
-                )
-            )
-            if spilled:
-                continue
-            combined = list(dict.fromkeys(chosen + list(opt.tls_link_indices)))
-            if are_tls_links_compatible(
-                combined,
-                active_green_links,
-                junc.tls_link_foe_matrix,
-                junc.junction_id,
-            ):
-                chosen = combined
-
-        return tuple(chosen)
+        return tuple(opt_map.tls_link_indices)
 
     def _fill_compatible_greens(
         self,
         junc: JunctionSpec,
         topology: RoadTopology,
         belief: SwarmBeliefState,
+        approaching: list[VehicleBelief],
+        maxsum_result: MaxSumResult | None,
+        dbn_snapshot: DBNStateSnapshot | None,
         active_green_links: set[int],
         corridor_q_spill: Mapping[str, float],
         corridor_rem_slots: Mapping[str, int],
         enable_spillback_gate: bool,
     ) -> None:
         theta_spill = self._cfg.spillback_threshold
-        candidates: list[tuple[float, float, str, int, tuple[int, ...]]] = []
+        turn_pressure: dict[tuple[str, int], float] = {}
+        for veh in approaching:
+            in_corr = topology.corridors[veh.corridor_id]
+            base_p = 1.0 + 0.08 * min(60.0, max(0.0, float(veh.wait_time_s)))
+            if maxsum_result is not None:
+                base_p += max(0.0, float(maxsum_result.net_crossing_preference.get(veh.veh_id, 0.0)))
+            if dbn_snapshot is not None:
+                base_p += 0.5 * max(0.0, float(dbn_snapshot.cascade_score.get(veh.veh_id, 0.0)))
+            for opt in in_corr.turn_options:
+                prob_t = float(veh.turn_probs[opt.turn_idx])
+                if prob_t > 1e-6:
+                    key = (veh.corridor_id, opt.turn_idx)
+                    turn_pressure[key] = turn_pressure.get(key, 0.0) + base_p * prob_t
+
+        candidates: list[tuple[int, float, float, str, int, tuple[int, ...]]] = []
 
         for in_cid in junc.incoming_corridors:
             in_corr = topology.corridors[in_cid]
             occ = float(belief.corridors[in_cid].occupancy_ratio) if in_cid in belief.corridors else 0.0
+            n_opts = len(in_corr.turn_options)
             for opt in in_corr.turn_options:
                 if not opt.tls_link_indices:
                     continue
@@ -649,13 +929,16 @@ class PriorityDAGScheduler:
                         continue
                     if corridor_rem_slots.get(opt.to_corridor, 1) <= 0:
                         continue
-                # Prefer high-occupancy incoming corridors and straight-through movements.
+                is_prot_left = 1 if (n_opts >= 3 and float(opt.angle_rad) > 0.45) else 0
+                mu_links = min(2.0, 0.65 + 0.35 * float(len(opt.tls_link_indices)))
+                pressure = (turn_pressure.get((in_cid, opt.turn_idx), 0.0) + 0.5 * occ) * mu_links
+                # Activate compatible Dual-Through + Right movements before protected left turns.
                 candidates.append(
-                    (-occ, abs(float(opt.angle_rad)), in_cid, opt.turn_idx, opt.tls_link_indices)
+                    (is_prot_left, -pressure, abs(float(opt.angle_rad)), in_cid, opt.turn_idx, opt.tls_link_indices)
                 )
 
         candidates.sort()
-        for _, _, _, _, link_tuple in candidates:
+        for _, _, _, _, _, link_tuple in candidates:
             if are_tls_links_compatible(
                 link_tuple,
                 active_green_links,

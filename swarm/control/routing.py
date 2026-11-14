@@ -101,17 +101,27 @@ def compute_broadcast_edge_costs(
                     require_finite(tau_s, f"DBNStateSnapshot.expected_delay_s[{vid}]")
                     delay_sum_s += max(0.0, min(1.0, d_prob)) * max(0.0, tau_s)
 
-            veh_delay_term = delay_sum_s / float(eff_lanes)
-            flux_term = cfg.reroute_flux_weight * (
+            n_corr_vehs = len(veh_by_corridor[cid])
+            mean_veh_delay_s = delay_sum_s / float(max(1, n_corr_vehs))
+            queue_discharge_s = 0.55 * (float(n_corr_vehs) / float(eff_lanes))
+            veh_delay_term = 0.45 * mean_veh_delay_s + queue_discharge_s
+            flux_term = 0.50 * cfg.reroute_flux_weight * (
                 max(0.0, occ_ratio) + max(0.0, exp_inflow) / float(max(1, eff_cap))
             )
             spill_term = cfg.reroute_spill_weight * q_spill
             lane_loss_term = (
-                free_time_s * (float(corr.base_lanes) / float(eff_lanes) - 1.0)
+                3.2 * free_time_s * (float(corr.base_lanes) / float(eff_lanes) - 1.0)
                 if eff_lanes < corr.base_lanes
                 else 0.0
             )
-            corridor_cost_s = free_time_s + veh_delay_term + flux_term + spill_term + lane_loss_term
+            minor_road_term = (
+                8.0
+                if (not corr.is_exit_fringe and corr.base_lanes <= 1)
+                else 0.0
+            )
+            corridor_cost_s = (
+                free_time_s + veh_delay_term + flux_term + spill_term + lane_loss_term + minor_road_term
+            )
 
         require_finite(corridor_cost_s, f"corridor_cost_s[{cid}]")
         if corridor_cost_s <= 0.0:

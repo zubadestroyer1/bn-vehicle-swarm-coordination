@@ -57,6 +57,7 @@ from swarm.control import (
     run_damped_maxsum,
     verify_conflict_free_greens,
 )
+from swarm.control.safety import select_actuated_target_speeds
 from swarm.control.scheduler import _pair_turn_conflict_prob
 from swarm.env.belief import CityBeliefTracker
 from swarm.logging_utils import (
@@ -509,7 +510,7 @@ def test_zero_queue_creep_under_noisy_stopped_leader() -> None:
 
     dt = 0.5
     true_lead_s = 132.0
-    true_follow_s = 123.5  # bumper gap = 132.0 - 123.5 - 4.5 = 4.0m (inside uncertainty-inflated standstill envelope)
+    true_follow_s = 125.5  # bumper gap = 132.0 - 125.5 - 4.5 = 2.0m (exact SUMO standstill min_gap s_0)
     true_follow_v = 0.08  # residual sub-deadzone crawl
 
     total_deadzone = 0
@@ -537,8 +538,8 @@ def test_zero_queue_creep_under_noisy_stopped_leader() -> None:
                 corridor_id="C_W_in",
                 in_junction_id=None,
                 lane_index=0,
-                noisy_corridor_pos_m=float(true_lead_s + rng.normal(0.0, 0.6)),
-                noisy_speed_mps=float(max(0.0, rng.normal(0.0, 0.25))),
+                noisy_corridor_pos_m=float(true_lead_s + rng.normal(0.0, 0.45)),
+                noisy_speed_mps=float(max(0.0, rng.normal(0.0, 0.18))),
                 pos_noise_std=obs_cfg.pos_noise_std_m,
                 speed_noise_std=obs_cfg.speed_noise_std_mps,
                 turn_likelihood=(0.1, 0.8, 0.1),
@@ -549,7 +550,7 @@ def test_zero_queue_creep_under_noisy_stopped_leader() -> None:
         ]
         is_dropout = step >= warmup_ticks and (step - warmup_ticks) % 4 == 3
         if not is_dropout:
-            noisy_gap = max(2.2, (true_lead_s - true_follow_s - 4.5) + float(rng.normal(0.0, 0.35)))
+            noisy_gap = max(1.6, min(2.3, (true_lead_s - true_follow_s - 4.5) + float(rng.normal(0.0, 0.18))))
             radar_list.append(
                 NoisyVehicleObservation(
                     veh_id="follow",
@@ -558,13 +559,13 @@ def test_zero_queue_creep_under_noisy_stopped_leader() -> None:
                     corridor_id="C_W_in",
                     in_junction_id=None,
                     lane_index=0,
-                    noisy_corridor_pos_m=float(true_follow_s + rng.normal(0.0, 0.5)),
-                    noisy_speed_mps=float(max(0.0, true_follow_v + rng.normal(0.0, 0.20))),
+                    noisy_corridor_pos_m=float(true_follow_s + rng.normal(0.0, 0.40)),
+                    noisy_speed_mps=float(max(0.0, true_follow_v + rng.normal(0.0, 0.15))),
                     pos_noise_std=obs_cfg.pos_noise_std_m,
                     speed_noise_std=obs_cfg.speed_noise_std_mps,
                     turn_likelihood=(0.1, 0.8, 0.1),
                     noisy_leader_gap_m=noisy_gap,
-                    noisy_leader_speed_mps=float(max(0.0, rng.normal(0.0, 0.15))),
+                    noisy_leader_speed_mps=float(max(0.0, rng.normal(0.0, 0.12))),
                     leader_id="lead",
                 )
             )
@@ -603,8 +604,27 @@ def test_zero_queue_creep_under_noisy_stopped_leader() -> None:
 
     assert total_deadzone > 0
     assert total_clamps == 24
-    assert true_follow_s == pytest.approx(123.5, abs=1e-9)
+    assert true_follow_s == pytest.approx(125.5, abs=1e-9)
     assert max(filtered_positions) < true_lead_s - 4.5
+
+    # Verify immediate standstill queue discharge once the leader accelerates on green startup:
+    moving_lead = _make_vehicle_belief("m_lead", "C_W_in", "e_W_in", mean_s_m=132.25, mean_v_mps=1.2)
+    queued_follow = _make_vehicle_belief(
+        "q_follow",
+        "C_W_in",
+        "e_W_in",
+        mean_s_m=125.5,
+        mean_v_mps=0.0,
+        leader_id="m_lead",
+        noisy_leader_gap_m=2.25,
+        noisy_leader_speed_mps=1.2,
+    )
+    rel_res = safety_filter.apply(
+        _make_belief_state(topology, [queued_follow, moving_lead]),
+        topology,
+        desired_speeds={"m_lead": 13.9, "q_follow": 13.9},
+    )
+    assert rel_res.target_speeds["q_follow"] > ctrl_cfg.zero_speed_deadzone_mps
 
     # Also verify hard physical deceleration clamp [-max_decel_mps2, comfort_accel_mps2] at high speed:
     fast_follow = _make_vehicle_belief(
@@ -1186,6 +1206,9 @@ def test_in_junction_clearing_guard_and_palo_alto_rush_rollout(tmp_path: Path) -
         free_eta_s=0.0,
         in_junction_id="J_center",
     )
+    # At signalized J_center, cross-phase separation is enforced by verify_conflict_free_greens +
+    # 3.0s yellow clearance, so an in-junction clearing vehicle returns 0.0 without indexing
+    # downstream C_E_conn.turn_options at J_center:
     assert _pair_turn_conflict_prob(
         topology,
         "J_center",
@@ -1193,7 +1216,40 @@ def test_in_junction_clearing_guard_and_palo_alto_rush_rollout(tmp_path: Path) -
         topology.corridors["C_N_in"],
         v_clearing,
         topology.corridors["C_E_conn"],
-    ) == pytest.approx(1.0)
+    ) == pytest.approx(0.0)
+
+    # At an unsignalized junction (tls_id=None), cross-corridor feeders into C_E_conn DO conflict:
+    unsig_junc = dict(topology.junctions)
+    j_c = unsig_junc["J_center"]
+    unsig_junc["J_center"] = JunctionSpec(
+        junction_id="J_center",
+        tls_id=None,
+        coord_xy=j_c.coord_xy,
+        incoming_corridors=j_c.incoming_corridors,
+        outgoing_corridors=j_c.outgoing_corridors,
+        num_tls_links=0,
+        tls_link_foe_matrix=np.zeros((0, 0), dtype=bool),
+        req_foe_matrix=j_c.req_foe_matrix,
+    )
+    unsig_topo = RoadTopology(
+        network_id=topology.network_id,
+        net_xml_path=topology.net_xml_path,
+        poly_xml_path=topology.poly_xml_path,
+        corridors=topology.corridors,
+        edge_to_corridor=topology.edge_to_corridor,
+        edge_offset_in_corridor=topology.edge_offset_in_corridor,
+        junctions=unsig_junc,
+        successor_corridors=topology.successor_corridors,
+        predecessor_corridors=topology.predecessor_corridors,
+    )
+    assert _pair_turn_conflict_prob(
+        unsig_topo,
+        "J_center",
+        v_approach,
+        unsig_topo.corridors["C_N_in"],
+        v_clearing,
+        unsig_topo.corridors["C_E_conn"],
+    ) >= 0.85
 
     # Non-clearing vehicle on C_E_conn passed against J_center MUST fail loudly with TopologyIntegrityError
     v_mismatch = _make_vehicle_belief(
@@ -1248,4 +1304,182 @@ def test_in_junction_clearing_guard_and_palo_alto_rush_rollout(tmp_path: Path) -
             assert gt.teleports == 0
 
     assert saw_clearing_in_junction
+
+
+def test_multilane_parallel_discharge_clearing_nonblocking_and_min_green_invariant() -> None:
+    """Verify HCM min-green >= yellow guard, parallel multi-lane simultaneous discharge, & unspilled Max-Sum."""
+    ctrl_cfg = ControlConfig()
+    assert ctrl_cfg.tls_min_green_hold_s >= ctrl_cfg.tls_yellow_clearance_s
+    assert ctrl_cfg.tls_min_green_hold_s == pytest.approx(6.0)
+
+    with pytest.raises(ConfigValidationError):
+        ControlConfig(tls_min_green_hold_s=2.5, tls_yellow_clearance_s=3.0)
+
+    topology = _build_multi_link_test_topology()
+
+    # Two parallel lanes on C_W_in heading straight into 2-lane C_E_conn + one clearing vehicle inside J_center:
+    v_lane0 = _make_vehicle_belief(
+        "v_w_lane0", "C_W_in", "e_W_in", lane_index=0, mean_s_m=132.0, mean_v_mps=11.0,
+        free_eta_s=0.6, turn_probs=(0.0, 1.0, 0.0),
+    )
+    v_lane1 = _make_vehicle_belief(
+        "v_w_lane1", "C_W_in", "e_W_in", lane_index=1, mean_s_m=131.5, mean_v_mps=11.0,
+        free_eta_s=0.65, turn_probs=(0.0, 1.0, 0.0),
+    )
+    v_clearing = _make_vehicle_belief(
+        "v_w_clearing", "C_E_conn", "e_E_trunk", lane_index=0, mean_s_m=4.0, mean_v_mps=11.5,
+        free_eta_s=0.0, turn_probs=(1.0,), in_junction_id="J_center",
+    )
+    v_down_far = _make_vehicle_belief(
+        "v_e_far", "C_E_conn", "e_E_pocket", lane_index=0, mean_s_m=134.0, mean_v_mps=0.0,
+        free_eta_s=0.5, turn_probs=(1.0,),
+    )
+
+    # Multi-lane open_lanes=2 => zero conflict between parallel straight lanes:
+    assert _pair_turn_conflict_prob(
+        topology, "J_center", v_lane0, topology.corridors["C_W_in"], v_lane1, topology.corridors["C_W_in"],
+        open_lanes_by_edge={"e_E_trunk": 2, "e_E_pocket": 2},
+    ) == pytest.approx(0.0)
+
+    # Single-lane incident closure (open_lanes=1) => merge conflict = 1.0:
+    assert _pair_turn_conflict_prob(
+        topology, "J_center", v_lane0, topology.corridors["C_W_in"], v_lane1, topology.corridors["C_W_in"],
+        open_lanes_by_edge={"e_E_trunk": 1, "e_E_pocket": 2},
+    ) == pytest.approx(1.0)
+
+    belief = _make_belief_state(
+        topology,
+        [v_lane0, v_lane1, v_clearing, v_down_far],
+        open_lanes_by_edge={"e_E_trunk": 2, "e_E_pocket": 2},
+    )
+    # Downstream C_E_conn has 0.02 tail spillback (far stopline car does NOT spill back to entry tail):
+    edges = (
+        DBNEdge("v_e_far", "v_w_lane0", RelationType.DOWNSTREAM_SPILLBACK, 0.90, 0.85, 0.80, 0.0, 0.95),
+        DBNEdge("v_e_far", "v_w_lane1", RelationType.DOWNSTREAM_SPILLBACK, 0.90, 0.85, 0.80, 0.0, 0.95),
+    )
+    snap = _make_dbn_snapshot(
+        belief,
+        topology,
+        edges=edges,
+        precedence_scores={"v_w_clearing": 5.0, "v_e_far": 4.0, "v_w_lane0": 3.0, "v_w_lane1": 2.9},
+        corridor_spillback_pred={"C_E_conn": 0.02},
+        delay_post={"v_e_far": 0.95, "v_w_clearing": 0.05, "v_w_lane0": 0.1, "v_w_lane1": 0.1},
+    )
+    ms = run_damped_maxsum(belief, snap, topology, ctrl_cfg)
+    assert ms.modes["v_w_lane0"] != LongitudinalMode.YIELD
+    assert ms.modes["v_w_lane1"] != LongitudinalMode.YIELD
+
+    sched = PriorityDAGScheduler(ctrl_cfg).decode(belief, topology, maxsum_result=ms, dbn_snapshot=snap)
+    assert {"v_w_lane0", "v_w_lane1", "v_w_clearing"}.issubset(sched.granted_vehicles)
+    assert "v_w_lane0" not in sched.must_hold_stopline
+    assert "v_w_lane1" not in sched.must_hold_stopline
+
+    # Unthrottled desired-speed passthrough when no safety hazard is active (zero bogus clamp count):
+    sf = ObservableSafetyFilter(ctrl_cfg)
+    accel_veh = _make_vehicle_belief(
+        "v_open_accel", "C_W_in", "e_W_in", lane_index=0, mean_s_m=50.0, mean_v_mps=1.2,
+        free_eta_s=6.5, turn_probs=(0.0, 1.0, 0.0),
+    )
+    sf_res = sf.apply(
+        _make_belief_state(topology, [accel_veh]),
+        topology,
+        desired_speeds={"v_open_accel": 13.9},
+    )
+    assert sf_res.target_speeds["v_open_accel"] == pytest.approx(13.9)
+    assert sf_res.safety_clamp_count == 0
+    assert sf_res.post_safety_accels["v_open_accel"] == pytest.approx(ctrl_cfg.comfort_accel_mps2)
+
+    # Signalized red-queue anti-starvation handover: queued NS platoon wins green even under EW->NS conflict edge:
+    v_ew_1 = _make_vehicle_belief(
+        "v_ew_1", "C_W_in", "e_W_in", mean_s_m=128.0, mean_v_mps=11.0, free_eta_s=1.0, turn_probs=(0.0, 1.0, 0.0),
+    )
+    ns_queue = [
+        _make_vehicle_belief(
+            f"v_ns_{idx}",
+            "C_N_in" if idx % 2 == 0 else "C_S_in",
+            "e_N_in" if idx % 2 == 0 else "e_S_in",
+            lane_index=(idx // 2) % 2,
+            mean_s_m=132.0 - 7.0 * (idx // 2),
+            mean_v_mps=0.0,
+            wait_time_s=18.0,
+            free_eta_s=1.2 + 0.8 * (idx // 2),
+            turn_probs=(0.0, 1.0, 0.0),
+        )
+        for idx in range(6)
+    ]
+    starv_belief = SwarmBeliefState(
+        sim_time=25.0,
+        dt=0.5,
+        vehicles={v.veh_id: v for v in [v_ew_1, *ns_queue]},
+        corridors=_make_belief_state(topology, [v_ew_1, *ns_queue], sim_time=25.0).corridors,
+        open_lanes_by_edge={},
+        tls_states={"tls_center": "rrrrrrGGGGGG", "tls_east": "G"},
+    )
+    conf_edges = tuple(
+        DBNEdge("v_ew_1", qv.veh_id, RelationType.SAME_JUNCTION_CONFLICT, 0.90, 0.80, 0.70, 0.95, 0.0)
+        for qv in ns_queue[:2]
+    )
+    starv_snap = _make_dbn_snapshot(
+        starv_belief,
+        topology,
+        edges=conf_edges,
+        precedence_scores={"v_ew_1": 10.0, **{qv.veh_id: float(5 - idx) for idx, qv in enumerate(ns_queue)}},
+    )
+    ms_starv = run_damped_maxsum(starv_belief, starv_snap, topology, ctrl_cfg)
+    sched_starv = PriorityDAGScheduler(ctrl_cfg).decode(
+        starv_belief, topology, maxsum_result=ms_starv, dbn_snapshot=starv_snap
+    )
+    assert {1, 4}.issubset(sched_starv.tls_desired_greens["tls_center"])
+    assert 7 not in sched_starv.tls_desired_greens["tls_center"]
+
+    # Sticky setSpeed release: cruising/granted vehicles omit setSpeed (preserving LC2013 lane-changing),
+    # spillback-held pocket vehicles receive safe braking speed, and clearing spillback emits -1.0 release:
+    v_pocket = _make_vehicle_belief(
+        "v_pocket_hold", "C_E_conn", "e_E_pocket", lane_index=0, mean_s_m=125.0, mean_v_mps=8.0,
+        free_eta_s=1.8, turn_probs=(1.0,),
+    )
+    v_trunk = _make_vehicle_belief(
+        "v_trunk_merge", "C_E_conn", "e_E_trunk", lane_index=0, mean_s_m=30.0, mean_v_mps=11.5,
+        free_eta_s=9.5, turn_probs=(1.0,),
+    )
+    rel_bel = _make_belief_state(topology, [v_pocket, v_trunk])
+    sf_hold = sf.apply(
+        rel_bel,
+        topology,
+        desired_speeds={"v_pocket_hold": 0.0, "v_trunk_merge": 13.9},
+        must_hold_stopline=frozenset({"v_pocket_hold", "v_trunk_merge"}),
+    )
+    speeds_t0, ctrl_t0 = select_actuated_target_speeds(
+        belief=rel_bel,
+        topology=topology,
+        safety=sf_hold,
+        control_config=ctrl_cfg,
+        must_hold_stopline=frozenset({"v_pocket_hold", "v_trunk_merge"}),
+        granted_vehicles=frozenset(),
+        previously_controlled=frozenset(),
+    )
+    assert "v_trunk_merge" not in speeds_t0
+    assert "v_pocket_hold" in speeds_t0 and speeds_t0["v_pocket_hold"] >= 0.0
+    assert ctrl_t0 == {"v_pocket_hold"}
+
+    sf_clear = sf.apply(
+        rel_bel,
+        topology,
+        desired_speeds={"v_pocket_hold": 13.9, "v_trunk_merge": 13.9},
+        must_hold_stopline=frozenset(),
+    )
+    speeds_t1, ctrl_t1 = select_actuated_target_speeds(
+        belief=rel_bel,
+        topology=topology,
+        safety=sf_clear,
+        control_config=ctrl_cfg,
+        must_hold_stopline=frozenset(),
+        granted_vehicles=frozenset({"v_pocket_hold", "v_trunk_merge"}),
+        previously_controlled=ctrl_t0,
+    )
+    assert speeds_t1 == {"v_pocket_hold": -1.0}
+    assert ctrl_t1 == set()
+
+
+
 

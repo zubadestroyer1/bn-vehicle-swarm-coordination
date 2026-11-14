@@ -251,6 +251,13 @@ def run_damped_maxsum(
         src_indices = np.empty(m_edges, dtype=np.int64)
         dst_indices = np.empty(m_edges, dtype=np.int64)
         payoffs = np.zeros((m_edges, _NUM_MODES, _NUM_MODES), dtype=np.float64)
+        down_spill_deg = np.zeros(n_veh, dtype=np.int64)
+        in_conflict_deg = np.zeros(n_veh, dtype=np.int64)
+        for edge in active_edges:
+            if edge.relation == RelationType.DOWNSTREAM_SPILLBACK:
+                down_spill_deg[vid_to_idx[edge.dst_id]] += 1
+            elif edge.relation == RelationType.SAME_JUNCTION_CONFLICT:
+                in_conflict_deg[vid_to_idx[edge.dst_id]] += 1
 
         for e_idx, edge in enumerate(active_edges):
             require_probability_range(edge.omega, f"DBNEdge[{edge.src_id}->{edge.dst_id}].omega")
@@ -275,8 +282,10 @@ def run_damped_maxsum(
 
             # A. Intra-junction conflict / cross-approach outgoing-corridor merge mutual exclusion.
             if edge.relation == RelationType.SAME_JUNCTION_CONFLICT:
-                eff_risk = max(p_conf_eff, 0.25)
+                eff_risk = p_conf_eff
                 if eff_risk > cfg.conflict_risk_threshold:
+                    conf_norm = math.sqrt(float(max(1, int(in_conflict_deg[d_i]))))
+                    eff_w = (omega * eff_risk) / conf_norm
                     for u_src in range(3):
                         for u_dst in range(3):
                             ov = min(t_out_arr[s_i, u_src], t_out_arr[d_i, u_dst]) - max(
@@ -285,10 +294,10 @@ def run_damped_maxsum(
                             if ov > 0.0:
                                 min_dur = max(0.5, min(clear_dur_arr[s_i, u_src], clear_dur_arr[d_i, u_dst]))
                                 norm_ov = ov / min_dur
-                                mat[u_src, u_dst] -= cfg.conflict_penalty * omega * eff_risk * (0.6 + norm_ov)
+                                mat[u_src, u_dst] -= cfg.conflict_penalty * eff_w * (0.6 + norm_ov)
                     # Precedence tie-break bonus when src precedes dst cleanly without overlap.
-                    mat[0, 2] += 0.08 * omega * eff_risk
-                    mat[0, 3] += 0.06 * omega * eff_risk
+                    mat[0, 2] += 0.08 * eff_w
+                    mat[0, 3] += 0.06 * eff_w
 
             # B. Same-corridor platoon & upstream-feeder green-wave speed harmonization.
             if edge.relation in (RelationType.SAME_CORRIDOR, RelationType.UPSTREAM_FEEDER):
@@ -298,9 +307,16 @@ def run_damped_maxsum(
                 mat[int(LongitudinalMode.YIELD), int(LongitudinalMode.GO_WAVE)] -= 2.8 * omega * (0.4 + 0.6 * kappa)
                 mat[int(LongitudinalMode.YIELD), int(LongitudinalMode.CRUISE)] -= 2.2 * omega * (0.4 + 0.6 * kappa)
 
-            # C. Inter-junction downstream spillback tail blockage coupling.
+            # C. Inter-junction downstream spillback tail blockage coupling (gated by dst tail spillback).
             if edge.relation == RelationType.DOWNSTREAM_SPILLBACK:
-                spill_strength = omega * (kappa + (1.0 - kappa) * gamma * max(0.0, min(1.0, d_src_post)))
+                q_dst_out = float(expected_out_spill.get(edge.dst_id, 0.0))
+                tail_gate = max(0.0, min(1.0, q_dst_out / max(theta_spill, 0.25)))
+                deg_norm = float(max(1, int(down_spill_deg[d_i])))
+                spill_strength = (
+                    (tail_gate / deg_norm)
+                    * omega
+                    * (kappa + (1.0 - kappa) * gamma * max(0.0, min(1.0, d_src_post)))
+                )
                 mat[:, int(LongitudinalMode.GO_WAVE)] -= cfg.spillback_penalty * spill_strength
                 mat[:, int(LongitudinalMode.CRUISE)] -= 0.9 * cfg.spillback_penalty * spill_strength
                 mat[:, int(LongitudinalMode.ECO_GLIDE)] -= 0.25 * cfg.spillback_penalty * spill_strength
